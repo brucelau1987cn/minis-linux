@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from minis import Provider, save_history
 from minis_input import Prompt
-from minis_telegram import Bot, TaskStopped
+from minis_telegram import MAX_REPLY_CHUNKS, ActiveTask, Bot, TaskControl, TaskStopped, Telegram
 from minis_web import _WebContext
 from test_streaming import DONE, UNSUPPORTED, Response, event, http_error, json_reply
 from test_web import SEARCH_HTML
@@ -171,6 +171,25 @@ class WebTurnTest(unittest.TestCase):
                 _, history = self.bot.generate(prompt, **kwargs)
                 self.assertIsNotNone(history)
         lookup.assert_not_called()
+
+    def test_telegram_reserves_space_for_sources_after_oversized_answer(self):
+        answer = '🙂' * (2_000 * MAX_REPLY_CHUNKS + 20)
+        api = Telegram('123:' + 'x' * 32)
+        bot = Bot(self.bot.home, self.bot.owner, 2, api, self.bot.provider, features=True)
+        self.open.side_effect = [json_reply(content=answer)]
+        tasks = TaskControl(bot)
+        self.addCleanup(tasks.close)
+        with (patch('minis_telegram.prepare_web', return_value=self.page()),
+              patch.object(api, 'request', return_value={'message_id': 1}) as request):
+            tasks.run(ActiveTask(0), 'Read https://example.org/readme')
+        calls = request.call_args_list
+        self.assertLessEqual(len(calls), MAX_REPLY_CHUNKS)
+        self.assertTrue(all(call.args[0] == 'sendMessage' for call in calls))
+        text = ''.join(call.args[1]['text'] for call in calls)
+        self.assertIn('已省略', text)
+        self.assertIn(self.page().source_footer, text)
+        self.assertIn('本轮模型：primary', text)
+        self.assertEqual(tasks.last, '已完成')
 
     @staticmethod
     def page():

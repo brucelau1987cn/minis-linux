@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import fcntl
 from hashlib import sha256
 import http.client
+from itertools import islice
 import json
 import logging
 import os
@@ -68,6 +69,35 @@ _BUNDLED_SKILLS = Path(__file__).resolve().parent / 'skills'
 
 class _WebReply(str):
     """Completed standalone analysis, intentionally not stored in a session."""
+
+    answer: str
+    sources: str
+
+    def __new__(cls, answer, sources):
+        reply = super().__new__(cls, answer + '\n\n' + sources)
+        reply.answer = answer
+        reply.sources = sources
+        return reply
+
+    def telegram_text(self, metadata):
+        # Sources are locally bounded to five public URLs of up to 2,048 chars.
+        # Keep model labels from consuming the space reserved for those links.
+        metadata = next(split_reply(metadata), '')
+
+        def fits(text):
+            return len(list(islice(split_reply(text), MAX_REPLY_CHUNKS + 1))) <= MAX_REPLY_CHUNKS
+
+        full = str(self) + metadata
+        if fits(full):
+            return full
+        suffix = '\n\n（回复太长，部分正文已省略。）\n\n' + self.sources + metadata
+        room = MAX_REPLY_CHUNKS - len(list(split_reply(suffix)))
+        prefix = list(islice(split_reply(self.answer), max(0, room)))
+        # Joining strings can shift UTF-16 chunk boundaries. Check the joined
+        # result rather than assuming the two independent counts are additive.
+        while prefix and not fits(''.join(prefix) + suffix):
+            prefix.pop()
+        return ''.join(prefix) + suffix
 
 
 class _TurnHistory(list):
@@ -787,7 +817,7 @@ class Bot:
         model = getattr(active, 'model', None)
         if on_model is not None and isinstance(model, str):
             on_model(model)
-        return _WebReply(without_urls(answer) + '\n\n' + web.source_footer)
+        return _WebReply(without_urls(answer), web.source_footer)
 
     @staticmethod
     def _bypassed_local_command(text, allow_commands):
@@ -1090,10 +1120,12 @@ class TaskControl:
                 if self.closed:
                     return
             try:
+                metadata = ''
                 if observed_models and outcome == '已完成':
-                    reply += '\n\n本轮模型：' + safe_display(observed_models[-1])
+                    metadata += '\n\n本轮模型：' + safe_display(observed_models[-1])
                 if notices:
-                    reply += '\n\n' + '\n'.join(notices)
+                    metadata += '\n\n' + '\n'.join(notices)
+                reply = reply.telegram_text(metadata) if isinstance(reply, _WebReply) else reply + metadata
                 if stream is None:
                     self.bot.send_reply(reply)
                 else:
