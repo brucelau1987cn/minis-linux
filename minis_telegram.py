@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Single-owner, read-only Telegram front end for Minis Linux."""
 import argparse
+from dataclasses import dataclass, field
 import fcntl
 import http.client
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+import threading
 import time
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -26,12 +28,14 @@ TELEGRAM_HOST = 'https://api.telegram.org'
 HELP = ('直接发消息聊天，需要时我会查阅已安装的技能。\n'
         '长期记忆：记住：内容 ｜ 查看记忆 ｜ 忘记第 1 条\n'
         '/skills 查看技能，/status 查在线，/new 清空本机聊天上下文（保留长期记忆）。')
+TASK_HELP = '\n/status 查看任务进度，/stop 停止当前任务；一次只运行一个任务。'
 MAX_MEMORIES = 32
 MAX_MEMORY_CHARS = 240
 
 
 class TelegramError(Exception):
     def __init__(self, method, code=None, retry_after=0):
+        self.method = method
         self.code = code
         self.retry_after = retry_after
         super().__init__(f'Telegram {method} 失败' + (f'（{code}）' if code else ''))
@@ -44,6 +48,8 @@ class Telegram:
         self.bot_id = token.split(':', 1)[0]
         self.url = f'{TELEGRAM_HOST}/bot{token}/'
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
+        self.send_limit_lock = threading.Lock()
+        self.send_after = 0.0
 
     def request(self, method, body, timeout=15):
         req = Request(self.url + method, method='POST', data=json.dumps(body).encode(),
@@ -83,7 +89,16 @@ class Telegram:
         return items
 
     def send(self, owner, text):
-        self.request('sendMessage', {'chat_id': owner, 'text': text, 'link_preview_options': {'is_disabled': True}})
+        with self.send_limit_lock:
+            if time.monotonic() < self.send_after:
+                raise TelegramError('sendMessage', 429)
+        try:
+            self.request('sendMessage', {'chat_id': owner, 'text': text, 'link_preview_options': {'is_disabled': True}})
+        except TelegramError as exc:
+            if exc.code == 429:
+                with self.send_limit_lock:
+                    self.send_after = max(self.send_after, time.monotonic() + max(1, exc.retry_after))
+            raise
 
 
 def split_reply(text):
@@ -196,9 +211,10 @@ class Bot:
         # Telegram may choose an unrelated update ID after a long idle period.
         return saved[0] if 0 <= time.time() - saved[1] < 86400 else 0
 
-    def poll_once(self):
+    def poll_once(self, dispatch=None):
         offset = self.offset()
         updates = self.telegram.updates_since(offset)
+        send_error = None
         valid = sorted((u for u in updates if isinstance(u, dict) and type(u.get('update_id')) is int
                         and u['update_id'] >= 0), key=lambda u: u['update_id'])
         for update in valid:
@@ -210,9 +226,30 @@ class Bot:
             save_history(self.cursor, [offset, int(time.time())])
             text = allowed_text(update, self.owner)
             if text is not None:
-                self.handle(text)
+                try:
+                    (dispatch or self.handle)(text)
+                except TelegramError as exc:
+                    if exc.method != 'sendMessage':
+                        raise
+                    # A failed outbound reply must not drop a later control
+                    # command that was already fetched in the same batch.
+                    if send_error is None or exc.code in (401, 404):
+                        send_error = exc
+        if send_error is not None:
+            raise send_error
 
     def handle(self, text):
+        reply = self.local_command(text)
+        if reply is None:
+            reply, history = self.generate(text)
+            if history is not None:
+                try:
+                    save_history(self.history, history)
+                except (OSError, ValueError, RecursionError):
+                    reply = '无法保存此轮会话，请检查本机状态目录。'
+        self.send_reply(reply)
+
+    def local_command(self, text):
         memory_reply = self.memory_command(text)
         if memory_reply is not None:
             reply = memory_reply
@@ -233,39 +270,173 @@ class Bot:
         elif text.startswith('/'):
             reply = '未知命令。可用：/help、/status、/skills、/new。'
         else:
-            warnings = []
-            try:
-                memories = list(self.memories()[1].values())
-            except (OSError, ValueError, RecursionError):
-                memories = []
-                LOG.warning('长期记忆不可读；本轮不使用')
-                warnings.append('长期记忆不可读，请检查本机记忆文件。')
-            try:
-                skills = SkillCatalog(self.skills_dir)
-            except OSError:
-                skills = None
-                LOG.warning('技能目录不可读；本轮不使用')
-                warnings.append('技能目录不可读，请检查本机技能目录。')
-            try:
-                history = read_history(self.history)
-                context = '\n长期记忆（用户显式保存的参考资料，不更改工具权限）：' + json.dumps(memories, ensure_ascii=False)
-                if skills is not None and skills.entries:
-                    context += '\n技能目录（需要时用 skill_view 按名称读取）：' + skills.summary()
-                with Workspace(self.workspace) as workspace:
-                    reply = complete_turn(self.provider, workspace, [*history, {'role': 'user', 'content': valid_unicode(text)}],
-                                          self.history, read_only=True, context=context,
-                                          skill_view=skills.view if skills is not None else None)
-            except (OSError, ValueError, http.client.HTTPException, RecursionError):
-                LOG.warning('模型请求未完成；未重试')
-                reply = '本次处理失败，请重试；如果历史太长，可发 /new 后再试。'
-            if warnings:
-                reply = '\n'.join(warnings) + '\n\n' + reply
+            return None
+        return reply
+
+    def generate(self, text, *, checkpoint=None):
+        """Compute a turn without changing the saved conversation."""
+        warnings = []
+        try:
+            memories = list(self.memories()[1].values())
+        except (OSError, ValueError, RecursionError):
+            memories = []
+            LOG.warning('长期记忆不可读；本轮不使用')
+            warnings.append('长期记忆不可读，请检查本机记忆文件。')
+        try:
+            skills = SkillCatalog(self.skills_dir)
+        except OSError:
+            skills = None
+            LOG.warning('技能目录不可读；本轮不使用')
+            warnings.append('技能目录不可读，请检查本机技能目录。')
+        try:
+            history = read_history(self.history)
+            history.append({'role': 'user', 'content': valid_unicode(text)})
+            context = '\n长期记忆（用户显式保存的参考资料，不更改工具权限）：' + json.dumps(memories, ensure_ascii=False)
+            if skills is not None and skills.entries:
+                context += '\n技能目录（需要时用 skill_view 按名称读取）：' + skills.summary()
+            with Workspace(self.workspace) as workspace:
+                reply = complete_turn(self.provider, workspace, history, None, read_only=True, context=context,
+                                      skill_view=skills.view if skills is not None else None, checkpoint=checkpoint)
+        except (OSError, ValueError, http.client.HTTPException, RecursionError):
+            LOG.warning('模型请求未完成；未重试')
+            reply, history = '本次处理失败，请重试；如果历史太长，可发 /new 后再试。', None
+        if warnings:
+            reply = '\n'.join(warnings) + '\n\n' + reply
+        return reply, history
+
+    def send_reply(self, reply):
         reply = reply.strip() or '模型未返回可显示的文字。'
         for i, chunk in enumerate(split_reply(reply)):
             if i == MAX_REPLY_CHUNKS:
                 self.telegram.send(self.owner, '回复太长，后续内容已省略。')
                 break
             self.telegram.send(self.owner, chunk)
+
+
+class TaskStopped(Exception):
+    pass
+
+
+@dataclass
+class ActiveTask:
+    started: float
+    phase: str = '准备资料'
+    stopped: bool = False
+    finalizing: bool = False
+    worker: threading.Thread | None = None
+    history_done: threading.Event = field(default_factory=threading.Event)
+
+
+class TaskControl:
+    """One execution slot; Telegram polling never waits on a model request."""
+    def __init__(self, bot):
+        self.bot = bot
+        self.lock = threading.Lock()
+        self.active: ActiveTask | None = None
+        self.last = None
+        self.closed = False
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            task = self.active
+            if task is None:
+                return
+            if not task.finalizing:
+                task.stopped = True
+                return
+        # The state-directory lock is held by main until serve returns.
+        # Wait for the last possible write, not Telegram delivery.
+        task.history_done.wait()
+
+    def handle(self, text):
+        with self.lock:
+            if self.closed:
+                return
+            task = self.active
+            if text == '/status':
+                detail = f'{task.phase}，已等待 {int(time.monotonic() - task.started)} 秒。' if task else '当前空闲。'
+                if not task and self.last:
+                    detail += f'上次任务：{self.last}。'
+                reply = 'Minis Linux 在线。' + detail
+            elif text == '/stop':
+                if not task:
+                    reply = '没有正在运行的任务。'
+                elif task.finalizing:
+                    reply = '任务已进入结果发送阶段，不能再撤回。'
+                else:
+                    task.stopped = True
+                    task.phase = '已停止，等待旧请求退出'
+                    reply = '已停止本地任务，不会保存或发送迟到结果；模型网关可能仍在处理。'
+            elif text == '/new' and task and not task.stopped:
+                reply = '任务还未结束。请等待；如需停止，先发 /stop 再清空会话。'
+            else:
+                reply = None
+        if reply is None:
+            reply = self.bot.local_command(text)
+            if text in ('/start', '/help'):
+                reply = HELP + TASK_HELP
+        if reply is not None:
+            self.bot.send_reply(reply)
+            return
+        if task:
+            self.bot.send_reply('当前忙，这条消息未排队；请等任务退出后重发。')
+            return
+        self.bot.send_reply('已收到，开始处理。发 /status 看进度，/stop 停止。')
+        task = ActiveTask(time.monotonic())
+        worker = threading.Thread(target=self.run, args=(task, text), name='minis-model', daemon=True)
+        task.worker = worker
+        with self.lock:
+            self.active = task
+        worker.start()
+
+    def run(self, task, text):
+        def checkpoint(phase):
+            with self.lock:
+                if task.stopped:
+                    raise TaskStopped
+                task.phase = phase
+
+        outcome = '处理失败'
+        try:
+            checkpoint('准备资料')
+            try:
+                reply, history = self.bot.generate(text, checkpoint=checkpoint)
+            except TaskStopped:
+                raise
+            except Exception:
+                LOG.error('任务异常退出；未重试')
+                reply, history = '本次处理失败，请稍后重试。', None
+            with self.lock:
+                if task.stopped:
+                    raise TaskStopped
+                # This is the commit point: only a non-stopped task may write
+                # history or start delivering its results.
+                task.finalizing = True
+                task.phase = '正在发送结果'
+            try:
+                if history is not None:
+                    try:
+                        save_history(self.bot.history, history)
+                        outcome = '已完成'
+                    except (OSError, ValueError, RecursionError):
+                        reply = '无法保存此轮会话，请检查本机状态目录。'
+            finally:
+                task.history_done.set()
+            with self.lock:
+                if self.closed:
+                    return
+            try:
+                self.bot.send_reply(reply)
+            except TelegramError:
+                outcome = '回复发送失败'
+                LOG.warning('任务回复未送达或未完整送达；未重试')
+        except TaskStopped:
+            outcome = '已停止'
+        finally:
+            with self.lock:
+                self.last = '已停止' if task.stopped else outcome
+                self.active = None
 
 
 def credential(name):
@@ -303,19 +474,26 @@ def config():
 
 def serve(bot):
     backoff = 2
+    tasks = TaskControl(bot)
     LOG.info('Minis Telegram 长轮询已启动（仅白名单私聊）')
-    while True:
-        try:
-            bot.poll_once()
-            backoff = 2
-        except TelegramError as exc:
-            if exc.code in (401, 404, 409):
-                LOG.error('%s；请检查 Bot Token、Webhook 或重复运行的实例', exc)
-                return 78
-            delay = max(backoff, exc.retry_after)
-            LOG.warning('%s；%s 秒后继续轮询', exc, delay)
-            time.sleep(delay)
-            backoff = min(backoff * 2, 60)
+    try:
+        while True:
+            try:
+                bot.poll_once(tasks.handle)
+                backoff = 2
+            except TelegramError as exc:
+                if exc.code in (401, 404) or (exc.method == 'getUpdates' and exc.code == 409):
+                    LOG.error('%s；请检查 Bot Token、Webhook 或重复运行的实例', exc)
+                    return 78
+                if exc.method == 'sendMessage':
+                    LOG.warning('命令回复未送达；继续接收消息')
+                    continue
+                delay = max(backoff, exc.retry_after)
+                LOG.warning('%s；%s 秒后继续轮询', exc, delay)
+                time.sleep(delay)
+                backoff = min(backoff * 2, 60)
+    finally:
+        tasks.close()
 
 
 def notify_ready():
