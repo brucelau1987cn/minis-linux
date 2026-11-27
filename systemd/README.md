@@ -63,7 +63,8 @@ sudo journalctl -u minis-linux-telegram.service -n 30 --no-pager
 
 - `StateDirectory=` 持久化在 `/var/lib/minis-linux-telegram`；使用 `DynamicUser=` 时 systemd 可能把实际目录放在 `/var/lib/private/` 下。会话和轮询游标不与命令行会话共用。日志不打印密钥、消息或模型响应正文。
 - Telegram 只能读该目录下 `workspace/` 顶层的普通文本文件，不提供 Shell 或写文件工具。需要处理文件时，只放专用、不含敏感信息的副本；工具结果可能发给模型，也可能进入 Telegram 回复。工作区限制不是通用沙箱；systemd 只允许服务修改自己的状态目录等必要位置。
-- 单实例串行处理。新消息保留同一 Telegram 会话上下文，重启后仍保留。超过一小时的缓存消息忽略；为避免重启时重复调用模型，处理前先记住消息序号，进程中途退出或回复发送失败时，该条可能没有回复，需要手动再发。Telegram 网络错误退避重连；无效 token / 轮询冲突停止，先修配置再启动。
+- Telegram 收消息与模型请求分开处理。一次只执行一个模型任务；忙时收到的新普通消息会明确提示**未排队**，不自动重试。`/status` 查询阶段和上次任务结果，`/stop` 停止尚未提交的任务。已停止的任务不会再保存为会话或发送结果；旧请求可能仍在模型网关执行，退出前占用唯一任务位。已经提交、正在发送的回复不能撤回。进行中要清空会话，请先 `/stop` 再 `/new`。
+- 已完成的会话重启后仍保留，进行中的任务不会自动重跑。超过一小时的缓存消息忽略；处理前先记住消息序号，进程中途退出或回复发送失败时，该条可能没有回复。Telegram **收消息**失败会退避重连；**发送回复**被限流时，仍处理收到的 `/stop`，只是确认消息可能发不出去。限流结束后可用 `/status` 确认结果。无效 token 或轮询冲突时服务停止，先修配置再启动。
 - 停用（保留配置和状态）：`sudo systemctl disable --now minis-linux-telegram.service`。修改配置、密钥或应用后用 `sudo systemctl restart minis-linux-telegram.service` 生效。
 
 ## 4. 技能与长期记忆

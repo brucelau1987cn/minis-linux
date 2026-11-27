@@ -255,12 +255,18 @@ def normalize_reply(raw):
 
 
 def complete_turn(provider, workspace, messages, history_path, *, demo=False, read_only=False,
-                  context='', skill_view=None):
+                  context='', skill_view=None, checkpoint=None):
     system = SYSTEM + (' 此入口的工具只读，不允许创建文件。' if read_only else '') + context
     for _ in range(MAX_STEPS):
+        if checkpoint is not None:
+            checkpoint('等待模型')
         reply = normalize_reply(provider.reply([{'role': 'system', 'content': system}, *messages]))
+        if checkpoint is not None:
+            checkpoint('处理模型结果')
         messages.append(reply)
         for call in reply.get('tool_calls', []):
+            if checkpoint is not None:
+                checkpoint('处理只读工具')
             if skill_view is not None and call['function']['name'] == 'skill_view':
                 try:
                     args = json.loads(call['function']['arguments'])
@@ -274,11 +280,11 @@ def complete_turn(provider, workspace, messages, history_path, *, demo=False, re
             else:
                 result = run_tool(workspace, call['function'], demo)
             messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': result})
-        if not read_only or not reply.get('tool_calls'):
+        if history_path is not None and (not read_only or not reply.get('tool_calls')):
             save_history(history_path, messages)
         if not reply.get('tool_calls'):
             return reply['content']
-    raise ValueError('达到工具循环上限，已停止' + ('' if read_only else '，会话已保存'))
+    raise ValueError('达到工具循环上限，已停止' + ('' if read_only or history_path is None else '，会话已保存'))
 
 
 def main():
