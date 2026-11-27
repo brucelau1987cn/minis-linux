@@ -2,13 +2,29 @@
 
 需要 Linux、systemd 247+、Python 3.10+、系统 CA 证书，以及到 Telegram Bot API 和模型网关的出站连接。**不用开端口，不要复用 Hermes 或其他程序正在使用的 Bot Token。** 先在 @BotFather 创建专用 bot，关闭加入群组的权限；拿到自己的 Telegram 数字用户 ID（不是 @用户名）。
 
-## 1. 安装应用和配置
+## 一键部署（推荐）
+
+```bash
+git clone https://github.com/brucelau1987cn/minis-linux.git && cd minis-linux && sudo /usr/bin/python3 -EsB install.py
+```
+
+需要 Python 3.10+（`/usr/bin/python3`）、Git、sudo 和连接到服务器的交互终端。只从信任的仓库或版本执行安装器。向导会询问 Telegram 数字用户 ID、模型地址和模型 ID，密钥输入不回显。已有完整配置时不问密钥，更新代码后重启并设置开机启动。现有配置不完整时停止，不覆盖。安装器不替你安装系统依赖、不创建 Telegram Bot、不开放防火墙，也不会自动更新代码。用 `python3 install.py --check` 可只校验安装包和 unit，不安装、不联网。
+
+**终端有录制时，不要在终端输入密钥。** `sudo`/堡垒机的输入日志可记录不回显的内容。通过受信任的安全文件传输或密钥管理流程，将 `telegram.token` 与 `model.key` 预先放在仓库外本人持有的私有目录中（目录 `0700`，文件 `0600`，每个文件一行）。然后执行 `sudo /usr/bin/python3 -EsB install.py --credentials-dir "$HOME/.config/minis-install-input"`，向导只问非密钥配置，安装器从文件读取密钥。按本机凭据管理约定处理输入文件，不要提交进 Git。
+
+systemd 在程序校验本机配置和初始化状态后才标记启动成功。若更新或启动失败，安装器尝试恢复原程序和服务文件，以及更新前运行中的服务；不会回退聊天或删除凭据。Telegram、模型网关连通性仍需用 `/status` 和普通对话分别验证。
+
+下列是可选的手工步骤；如果已用一键部署，跳过第 1 节和第 2 节的安装命令，直接去 Bot 私聊验收。
+
+## 1. 手工安装应用和配置
 
 在本仓库目录运行。脚本和服务文件由 root 安装；服务进程使用 systemd 分配的非 root 动态用户。下方 `install ... telegram.conf` 只在首次安装时运行，升级时保留现有配置和密钥。
 
 ```bash
 sudo install -d -m 0755 /opt/minis-linux
-sudo install -m 0644 minis.py minis_telegram.py /opt/minis-linux/
+sudo install -m 0644 minis.py minis_telegram.py minis_skills.py /opt/minis-linux/
+sudo install -d -m 0755 /opt/minis-linux/skills/weekly-report
+sudo install -m 0644 skills/weekly-report/SKILL.md /opt/minis-linux/skills/weekly-report/
 sudo install -d -m 0700 /etc/minis-linux
 sudo install -m 0600 systemd/telegram.conf.example /etc/minis-linux/telegram.conf
 sudoedit /etc/minis-linux/telegram.conf
@@ -41,7 +57,7 @@ sudo systemctl status minis-linux-telegram.service --no-pager
 sudo journalctl -u minis-linux-telegram.service -n 30 --no-pager
 ```
 
-打开专用 bot 私聊：先发 `/status` 验 Telegram 收发，再发一句自然语言验模型。`/status` **不调用模型**。`/new` 清除本机该入口的对话历史（不会删除 Telegram 聊天记录）。不接受群消息或其他账号；配置中的 ID 必须与私聊发送者一致。若报 `409`，检查该新 bot 是否还配置了 webhook 或存在另一个轮询进程；程序不会替你删除 webhook。
+打开专用 bot 私聊：先发 `/status` 验 Telegram 收发，再发一句自然语言验模型。`/status` **不调用模型**。不接受群消息或其他账号；配置中的 ID 必须与私聊发送者一致。若报 `409`，检查该新 bot 是否还配置了 webhook 或存在另一个轮询进程；程序不会替你删除 webhook。
 
 ## 3. 状态、权限与停止
 
@@ -49,3 +65,15 @@ sudo journalctl -u minis-linux-telegram.service -n 30 --no-pager
 - Telegram 只能读该目录下 `workspace/` 顶层的普通文本文件，不提供 Shell 或写文件工具。需要处理文件时，只放专用、不含敏感信息的副本；工具结果可能发给模型，也可能进入 Telegram 回复。工作区限制不是通用沙箱；systemd 只允许服务修改自己的状态目录等必要位置。
 - 单实例串行处理。新消息保留同一 Telegram 会话上下文，重启后仍保留。超过一小时的缓存消息忽略；为避免重启时重复调用模型，处理前先记住消息序号，进程中途退出或回复发送失败时，该条可能没有回复，需要手动再发。Telegram 网络错误退避重连；无效 token / 轮询冲突停止，先修配置再启动。
 - 停用（保留配置和状态）：`sudo systemctl disable --now minis-linux-telegram.service`。修改配置、密钥或应用后用 `sudo systemctl restart minis-linux-telegram.service` 生效。
+
+## 4. 技能与长期记忆
+
+- 普通消息、技能调用和记忆管理都在**同一个私聊**。发 `/skills` 查看技能，再发「用 weekly-report 技能整理周报」。技能放在 `/opt/minis-linux/skills/<名称>/SKILL.md`；普通用户前台运行默认读 `<状态目录>/skills`，也可用 `--skills-dir` 指定。仅安装信任的本地文本；格式参考仓库示例，要求单行 `description:`。模型先看到目录，按需用 `skill_view` 读取正文。不执行脚本，不安装、更新或操作其他系统的 Skills。
+- 发「记住：周报用中文」显式保存，发「查看记忆」查看条目，「忘记第 1 条」删除对应编号。编号固定，删除后不重用。最多 32 条，每条不超过 240 字符（单行）。模型和技能不能写入记忆。记忆在本机以明文保存，后续模型请求会携带当前条目；不要存密钥或隐私资料。若长期记忆文件或技能目录不可读，普通聊天仍可用，回复会提示暂时不用对应功能。
+- `/new` 只清空 Minis 本机聊天上下文。忘记某条不会抹去之前普通对话、远端模型记录或 Telegram 聊天记录。已加载技能正文可能存在旧聊天上下文；如果撤下或更换技能并希望旧内容不再随对话发送，发 `/new`。
+
+已用新版安装器安装后，在任意目录执行 `minis update --check` 查看候选版本，执行 `minis update` 更新。更新需要 Git 2.34+、支持 SSH 签名的 OpenSSH（`/usr/bin/ssh-keygen`）、sudo 和到 GitHub 的 HTTPS 连接。只有通过内置公钥验签的 `vX.Y.Z` 标签才可安装。若旧版还没有 `minis` 命令，在新版源码目录运行安装器；已有完整配置时不会重新询问凭据。
+
+若安装被强制中断，下次安装会先尝试恢复上一版。也可从可信安装包执行 `sudo /usr/bin/python3 -EsB install.py --recover`，只恢复中断前的程序、版本和服务。版本号只在服务通过本机启动检查后写入。
+
+`minis` 打开本地终端对话。默认数据在 `~/.local/share/minis-linux-terminal`，不读取 systemd 服务的密钥或 Telegram 聊天记录；不能放到 Git 工作树内。首次交互输入后保存的 API Key 为本机 `0600` 明文；通过 `MINIS_API_KEY` 提供的密钥不落盘。`minis --demo` 用独立临时状态，不改真实会话。终端和 Telegram 都不开放 Shell。

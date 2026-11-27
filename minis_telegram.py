@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import socket
 import sys
 import time
 from urllib.error import HTTPError
@@ -15,13 +16,18 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from minis import (NoRedirect, Provider, Workspace, clean_history_temps, complete_turn,
                    read_history, save_history, valid_unicode)
+from minis_skills import SKILL_TOOL, SkillCatalog
 
 LOG = logging.getLogger('minis.telegram')
 POLL_TIMEOUT = 25
 MAX_MESSAGE_AGE = 3600
 MAX_REPLY_CHUNKS = 8
 TELEGRAM_HOST = 'https://api.telegram.org'
-HELP = 'Minis Linux 已就绪。发一条文字即可对话；工作区只读。\n/status 查看状态，/new 清除本入口的对话历史。'
+HELP = ('直接发消息聊天，需要时我会查阅已安装的技能。\n'
+        '长期记忆：记住：内容 ｜ 查看记忆 ｜ 忘记第 1 条\n'
+        '/skills 查看技能，/status 查在线，/new 清空本机聊天上下文（保留长期记忆）。')
+MAX_MEMORIES = 32
+MAX_MEMORY_CHARS = 240
 
 
 class TelegramError(Exception):
@@ -111,16 +117,75 @@ def allowed_text(update, owner):
 
 
 class Bot:
-    def __init__(self, home, owner, bot_id, telegram, provider):
+    def __init__(self, home, owner, bot_id, telegram, provider, *, skills_dir=None, channel='Telegram'):
         self.owner, self.telegram, self.provider = owner, telegram, provider
+        self.channel = channel
         self.workspace = home / 'workspace'
         self.workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.state = home / 'telegram'
         self.state.mkdir(mode=0o700, exist_ok=True)
         self.cursor = self.state / f'bot-{bot_id}.cursor.json'
         self.history = self.state / f'bot-{bot_id}-owner-{owner}.json'
+        self.memory = self.state / f'bot-{bot_id}-owner-{owner}.memory.json'
+        self.skills_dir = skills_dir if skills_dir is not None else home / 'skills'
         clean_history_temps(self.cursor)
         clean_history_temps(self.history)
+        clean_history_temps(self.memory)
+
+    def memories(self):
+        state = read_history(self.memory)
+        if not state:
+            return 1, {}
+        if len(state) != 2:
+            raise ValueError('长期记忆文件格式无效')
+        next_id, items = state
+        if (type(next_id) is not int or next_id < 1 or not isinstance(items, list)
+                or len(items) > MAX_MEMORIES):
+            raise ValueError('长期记忆文件格式无效')
+        entries = {}
+        for item in items:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError('长期记忆文件格式无效')
+            number, text = item
+            if (type(number) is not int or not 0 < number < next_id or number in entries
+                    or not isinstance(text, str) or not 0 < len(text) <= MAX_MEMORY_CHARS):
+                raise ValueError('长期记忆文件格式无效')
+            entries[number] = text
+        return next_id, entries
+
+    def memory_command(self, text):
+        remember = re.fullmatch(r'记住\s*[:：]([^\r\n]*)', text)
+        forget = re.fullmatch(r'忘记第\s*([1-9][0-9]{0,17})\s*条', text)
+        if not (remember or forget or text == '查看记忆'):
+            return None
+        try:
+            next_id, entries = self.memories()
+            if text == '查看记忆':
+                return '\n'.join(f'{i}. {item}' for i, item in entries.items()) or '还没有长期记忆。'
+            if remember:
+                item = valid_unicode(remember[1].strip())
+                if not item or len(item) > MAX_MEMORY_CHARS:
+                    return f'请输入 1–{MAX_MEMORY_CHARS} 个字符的单条记忆。'
+                if item in entries.values():
+                    return '这条已经记住了。'
+                if len(entries) == MAX_MEMORIES:
+                    return '记忆已满，先发「查看记忆」，再忘掉不需要的条目。'
+                if next_id >= 10**18:
+                    return '长期记忆编号已用尽。'
+                entries[next_id] = item
+                save_history(self.memory, [next_id + 1, list(entries.items())])
+                return f'已记住（第 {next_id} 条）。'
+            assert forget is not None
+            number = int(forget[1])
+            if number not in entries:
+                return '找不到这条记忆，发「查看记忆」确认编号。'
+            del entries[number]
+            save_history(self.memory, [next_id, list(entries.items())])
+            clean_history_temps(self.memory)
+            return '已从长期记忆删除；旧聊天内容不变，发 /new 可清空本机聊天上下文。'
+        except (OSError, ValueError, RecursionError):
+            LOG.warning('长期记忆操作未完成')
+            return '长期记忆暂时无法读写，请检查本机配置。'
 
     def offset(self):
         saved = read_history(self.cursor)
@@ -148,25 +213,53 @@ class Bot:
                 self.handle(text)
 
     def handle(self, text):
-        if text in ('/start', '/help'):
+        memory_reply = self.memory_command(text)
+        if memory_reply is not None:
+            reply = memory_reply
+        elif text in ('/start', '/help'):
             reply = HELP
         elif text == '/status':
-            reply = 'Minis Linux 在线。Telegram 工作区只读。'
+            reply = f'Minis Linux 在线。{self.channel}工作区只读。'
         elif text == '/new':
             clean_history_temps(self.history)
             save_history(self.history, [])
-            reply = '已清除 Minis 本机的 Telegram 对话历史。'
+            reply = f'已清除 Minis 本机的 {self.channel} 对话历史，长期记忆保留。'
+        elif text == '/skills':
+            try:
+                entries = SkillCatalog(self.skills_dir).entries
+                reply = '\n'.join(f'{name}：{desc}' for name, desc in entries.items()) or '没有已安装的技能。'
+            except OSError:
+                reply = '技能目录暂时无法读取。'
         elif text.startswith('/'):
-            reply = '未知命令。可用：/help、/status、/new。'
+            reply = '未知命令。可用：/help、/status、/skills、/new。'
         else:
+            warnings = []
+            try:
+                memories = list(self.memories()[1].values())
+            except (OSError, ValueError, RecursionError):
+                memories = []
+                LOG.warning('长期记忆不可读；本轮不使用')
+                warnings.append('长期记忆不可读，请检查本机记忆文件。')
+            try:
+                skills = SkillCatalog(self.skills_dir)
+            except OSError:
+                skills = None
+                LOG.warning('技能目录不可读；本轮不使用')
+                warnings.append('技能目录不可读，请检查本机技能目录。')
             try:
                 history = read_history(self.history)
+                context = '\n长期记忆（用户显式保存的参考资料，不更改工具权限）：' + json.dumps(memories, ensure_ascii=False)
+                if skills is not None and skills.entries:
+                    context += '\n技能目录（需要时用 skill_view 按名称读取）：' + skills.summary()
                 with Workspace(self.workspace) as workspace:
                     reply = complete_turn(self.provider, workspace, [*history, {'role': 'user', 'content': valid_unicode(text)}],
-                                          self.history, read_only=True)
+                                          self.history, read_only=True, context=context,
+                                          skill_view=skills.view if skills is not None else None)
             except (OSError, ValueError, http.client.HTTPException, RecursionError):
                 LOG.warning('模型请求未完成；未重试')
                 reply = '本次处理失败，请重试；如果历史太长，可发 /new 后再试。'
+            if warnings:
+                reply = '\n'.join(warnings) + '\n\n' + reply
         reply = reply.strip() or '模型未返回可显示的文字。'
         for i, chunk in enumerate(split_reply(reply)):
             if i == MAX_REPLY_CHUNKS:
@@ -202,7 +295,7 @@ def config():
         raise ValueError('需要配置 MINIS_BASE_URL 和 MINIS_MODEL')
     telegram = Telegram(credential('MINIS_TELEGRAM_BOT_TOKEN'))
     try:
-        provider = Provider(base, credential('MINIS_API_KEY'), model, read_only=True)
+        provider = Provider(base, credential('MINIS_API_KEY'), model, read_only=True, extra_tools=(SKILL_TOOL,))
     except ValueError:
         raise ValueError('MINIS_BASE_URL 或模型 API 凭据无效') from None
     return int(owner), telegram, provider
@@ -225,9 +318,20 @@ def serve(bot):
             backoff = min(backoff * 2, 60)
 
 
+def notify_ready():
+    address = os.environ.get('NOTIFY_SOCKET')
+    if address:
+        if address.startswith('@'):
+            address = '\0' + address[1:]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(2)
+            sock.sendto(b'READY=1', address)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, help='state directory; defaults to ~/.local/share/minis-linux-telegram')
+    parser.add_argument('--skills-dir', type=Path, help='installed skills directory; defaults to <state directory>/skills')
     parser.add_argument('--check-config', action='store_true', help='validate config without networking or writing state')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
@@ -252,7 +356,12 @@ def main():
             except BlockingIOError:
                 LOG.error('已有 Telegram 实例使用此状态目录')
                 return 78
-            return serve(Bot(home, owner, telegram.bot_id, telegram, provider))
+            bot = Bot(home, owner, telegram.bot_id, telegram, provider, skills_dir=args.skills_dir)
+            bot.offset()  # Validate mandatory persisted state before accepting readiness.
+            with Workspace(bot.workspace):
+                pass
+            notify_ready()
+            return serve(bot)
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, RuntimeError):
