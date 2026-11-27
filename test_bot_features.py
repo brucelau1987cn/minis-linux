@@ -306,10 +306,12 @@ class BotFeaturesTest(unittest.TestCase):
         with patch('minis_telegram.prepare_web', return_value=web) as lookup:
             reply, history = self.bot.generate('搜索：新主题')
             lookup.assert_called_once_with('搜索：新主题')
-            self.assertIn('untrusted fixture excerpt', self.model.requests[-1][0]['content'])
+            self.assertNotIn('untrusted fixture excerpt', self.model.requests[-1][0]['content'])
+            self.assertEqual(self.model.requests[-1][1]['role'], 'user')
+            self.assertIn('untrusted fixture excerpt', self.model.requests[-1][1]['content'])
             self.assertIn(web.source_footer, reply)
-            self.assertNotIn(web.source_footer, repr(history))
-            self.assertNotIn('untrusted fixture excerpt', repr(history))
+            self.assertIsNone(history)
+            self.assertEqual(read_history(self.bot.history), [{'role': 'user', 'content': 'https://old.invalid/'}])
         with patch('minis_telegram.prepare_web') as lookup:
             self.bot.handle(Prompt('/new https://pasted.invalid/', allow_commands=False))
             self.bot.handle(Prompt('记住：https://pasted.invalid/', allow_commands=False))

@@ -17,6 +17,37 @@ from test_telegram import FakeProvider, FakeTelegram, message
 
 
 class ServiceV040Test(unittest.TestCase):
+    def test_successful_web_reply_reports_model_without_saving_history(self):
+        from minis_web import _WebContext
+
+        class WebFixture:
+            model = 'fixture-model'
+
+            def reply(self, _messages):
+                started.set()
+                if not release.wait(3):
+                    raise TimeoutError('fixture not released')
+                return {'content': '网页摘要'}
+
+        started, release = threading.Event(), threading.Event()
+        self.bot.provider = WebFixture()
+        with patch('minis_telegram.prepare_web', return_value=_WebContext(
+                'fixture page', [(1, 'https://example.org/page')])):
+            try:
+                self.tasks.handle('打开 https://example.org/page')
+                self.assertTrue(started.wait(1))
+                active = self.tasks.active
+                assert active is not None and active.worker is not None
+                worker = active.worker
+            finally:
+                release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+        self.assertIn('本轮模型：fixture-model', self.api.sent[-1][1])
+        self.tasks.handle('/status')
+        self.assertIn('已完成', self.api.sent[-1][1])
+        self.assertEqual(read_history(self.bot.history), [])
+
     def setUp(self):
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

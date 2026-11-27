@@ -66,6 +66,10 @@ _MAX_RECEIPTS = 128
 _BUNDLED_SKILLS = Path(__file__).resolve().parent / 'skills'
 
 
+class _WebReply(str):
+    """Completed standalone analysis, intentionally not stored in a session."""
+
+
 class _TurnHistory(list):
     """List-compatible result carrying the path selected before inference."""
     def __init__(self, rows, path):
@@ -783,7 +787,7 @@ class Bot:
         model = getattr(active, 'model', None)
         if on_model is not None and isinstance(model, str):
             on_model(model)
-        return without_urls(answer) + '\n\n' + web.source_footer
+        return _WebReply(without_urls(answer) + '\n\n' + web.source_footer)
 
     @staticmethod
     def _bypassed_local_command(text, allow_commands):
@@ -1078,13 +1082,15 @@ class TaskControl:
                         outcome = '已完成'
                     except (OSError, ValueError, RecursionError):
                         reply = '无法保存此轮会话，请检查本机状态目录。'
+                elif isinstance(reply, _WebReply):
+                    outcome = '已完成'
             finally:
                 task.history_done.set()
             with self.lock:
                 if self.closed:
                     return
             try:
-                if observed_models and history is not None and outcome == '已完成':
+                if observed_models and outcome == '已完成':
                     reply += '\n\n本轮模型：' + safe_display(observed_models[-1])
                 if notices:
                     reply += '\n\n' + '\n'.join(notices)
