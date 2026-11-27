@@ -18,11 +18,13 @@ import sys
 import tempfile
 import termios
 from time import monotonic
+from typing import TypeGuard
 from unicodedata import category, east_asian_width
 from urllib.parse import urlsplit
 from urllib.error import HTTPError
 from urllib.request import Request
 
+import minis_input
 from minis import HTTP_LIMIT, Provider, read_history, safe_display, save_history
 from minis_search import search_web
 from minis_skills import SKILL_TOOL, SkillCatalog
@@ -145,7 +147,93 @@ def update(*, check, current, git=git_command, run=subprocess.run):
 
 class Terminal:
     def send(self, owner, text):
-        print(f'Minis › {safe_display(text)}', flush=True)
+        print_reply(text)
+
+
+def print_reply(text):
+    print(f'Minis › {safe_display(text)}', flush=True)
+
+
+def report_model(model):
+    if model is not None:
+        print(f'本轮模型：{safe_display(model)}', flush=True)
+
+
+class TerminalStream:
+    """Render public deltas, with a separate line for each streamed model round."""
+
+    def __init__(self):
+        self.fragments = []
+        self.model = None
+
+    def end_round(self):
+        if self.fragments:
+            print(flush=True)
+
+    def checkpoint(self, stage):
+        if stage == '等待模型':  # complete_turn: immediately before each model round
+            self.end_round()
+            self.fragments.clear()
+
+    def delta(self, text):
+        if text:
+            print(('' if self.fragments else 'Minis › ') + safe_display(text), end='', flush=True)
+            self.fragments.append(text)
+
+    def used_model(self, model):
+        self.model = model
+
+    def remaining(self, reply, history):
+        # Intermediate SSE text stays in scrollback, but is not the final
+        # answer. If the last round was JSON, print the full final reply even
+        # if it is identical to something from an earlier tool round.
+        if not (history and self.fragments):
+            return reply
+        body = history[-1].get('content') if history[-1].get('role') == 'assistant' else None
+        if not isinstance(body, str) or body != ''.join(self.fragments):
+            return reply
+        # Bot can wrap the model body with local warnings and source citations.
+        # Replay only those additions, not the already displayed final body.
+        for text in (body, body.strip()):
+            if not text:
+                continue
+            start = reply.find(text)
+            while start != -1:
+                end = start + len(text)
+                if ((start == 0 or reply.endswith('\n\n', 0, start))
+                        and (end == len(reply) or reply.startswith('\n\n', end))):
+                    before, after = reply[:start], reply[end:]
+                    return '\n\n'.join(part.strip() for part in (before, after) if part.strip())
+                start = reply.find(text, start + 1)
+        return reply
+
+
+def stream_turn(chat, prompt, fallback):
+    if prompt.allow_commands:
+        reply = chat.local_command(prompt)
+        if reply is not None:
+            chat.send_reply(reply)
+            return
+    stream, proposals = TerminalStream(), []
+    try:
+        reply, history = chat.generate(prompt, checkpoint=stream.checkpoint, on_delta=stream.delta,
+                                       on_notice=print_reply, on_model=stream.used_model,
+                                       proposals=proposals, fallback_model=fallback)
+    finally:
+        stream.end_round()
+    extra = stream.remaining(reply, history)
+    previews = []
+    if history is not None:
+        try:
+            previews = chat.commit_turn(history, proposals)
+        except (OSError, ValueError, RecursionError):
+            chat.send_reply('无法保存此轮会话，请检查本机状态目录。')
+            return
+    if extra:
+        chat.send_reply(extra)
+    for preview in previews:
+        chat.send_reply(preview)
+    report_model(stream.model)
 
 
 class EchoDemo:
@@ -173,18 +261,62 @@ def terminal_config(home):
     raise ValueError('终端模型配置无效；请检查本人状态目录下的 terminal-config.json。')
 
 
+def valid_model_id(model) -> TypeGuard[str]:
+    return (isinstance(model, str) and 0 < len(model) <= 512 and model.isprintable()
+            and not any(ch.isspace() for ch in model))
+
+
+class TerminalProvider(Provider):
+    gateway_profile: str | None = None
+
+
 def make_provider(base, model, key, *, validate_model=False):
     if not key or len(key) > 4096 or any(not 33 <= ord(ch) <= 126 for ch in key):
         raise ValueError('模型 API Key 无效。')
-    if not model or (validate_model and (len(model) > 512 or not model.isprintable()
-                                         or any(ch.isspace() for ch in model))):
+    if not model or (validate_model and not valid_model_id(model)):
         raise ValueError('模型 ID 无效。')
     try:
         if '?' in base or '#' in base or any(ch.isspace() or not ch.isprintable() for ch in base):
             raise ValueError('Invalid URL')
-        return Provider(base, key, model, read_only=True, extra_tools=(SKILL_TOOL,))
+        return TerminalProvider(base, key, model, read_only=True, extra_tools=(SKILL_TOOL,))
     except ValueError:
         raise ValueError('模型 Base URL 无效，请填写 OpenAI 兼容地址（通常以 /v1 结尾）。') from None
+
+
+FALLBACK_FILE = 'terminal-fallbacks.json'
+
+
+def terminal_fallbacks(home):
+    path = home / FALLBACK_FILE
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {}
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ValueError('备用模型配置必须是本人持有的私有普通文件。')
+    rows = read_history(path)
+    settings = {}
+    for row in rows:
+        if (not isinstance(row, list) or len(row) != 3
+                or not all(isinstance(v, str) and v for v in row) or not valid_model_id(row[2])
+                or row[0] in settings):
+            raise ValueError('备用模型配置无效；请检查 terminal-fallbacks.json。')
+        name, endpoint, model = row
+        settings[name] = (endpoint, model)
+    return settings
+
+
+def gateway_fallback(provider, settings):
+    saved = settings.get(getattr(provider, 'gateway_profile', None))
+    if saved is not None and saved[0] == provider.endpoint and saved[1] != provider.model:
+        return saved[1]
+    return None
+
+
+def gateway_profile(gateways, name):
+    # Legacy readers permit manually edited, ambiguous names. Never attach a
+    # fallback to either of two indistinguishable profiles.
+    return name if sum(row[0].casefold() == name.casefold() for row in gateways) == 1 else None
 
 
 def read_paste_marker(fd, *, pasting):
@@ -264,21 +396,24 @@ def ask_secret(prompt):
 def terminal_provider(home):
     config, gateways, active = terminal_config(home)
     if gateways:
-        _, base, model, key = gateways[active]
-    else:
-        # Prefer a one-off environment configuration, which is never persisted.
-        base, model, key = (os.getenv(k, '') for k in ('MINIS_BASE_URL', 'MINIS_MODEL', 'MINIS_API_KEY'))
-        key_from_env = bool(key)
-        if not (base and model and key):
-            print('首次终端配置（与 Telegram 分开）。录制键盘输入的终端请使用预置环境变量，不要输入密钥。')
-            base = base or input('模型 Base URL（含 /v1）: ').strip()
-            model = model or input('模型 ID: ').strip()
-            key = key or ask_secret('模型 API Key: ')
-            provider = make_provider(base, model, key)
-            if not key_from_env:
-                save_history(config, [base, model, key])
-            return provider
-    return make_provider(base, model, key)
+        name, base, model, key = gateways[active]
+        provider = make_provider(base, model, key)
+        provider.gateway_profile = gateway_profile(gateways, name)
+        return provider
+    # Prefer a one-off environment configuration, which is never persisted.
+    base, model, key = (os.getenv(k, '') for k in ('MINIS_BASE_URL', 'MINIS_MODEL', 'MINIS_API_KEY'))
+    if base and model and key:
+        return make_provider(base, model, key)
+    key_from_env = bool(key)
+    print('首次终端配置（与 Telegram 分开）。录制键盘输入的终端请使用预置环境变量，不要输入密钥。')
+    base = base or input('模型 Base URL（含 /v1）: ').strip()
+    model = model or input('模型 ID: ').strip()
+    key = key or ask_secret('模型 API Key: ')
+    provider = make_provider(base, model, key)
+    if not key_from_env:
+        save_history(config, [base, model, key])
+        provider.gateway_profile = '原有网关'
+    return provider
 
 
 @contextmanager
@@ -313,8 +448,7 @@ def model_catalog(provider):
     if not isinstance(data, dict) or not isinstance(data.get('data'), list):
         raise ValueError('模型目录格式无效。')
     ids = (row.get('id') for row in data['data'] if isinstance(row, dict))
-    return sorted({model for model in ids if isinstance(model, str) and 0 < len(model) <= 512
-                   and model.isprintable() and not any(ch.isspace() for ch in model)})
+    return sorted({model for model in ids if valid_model_id(model)})
 
 
 def unicode_menu():
@@ -515,27 +649,61 @@ def model_command(home, *, model_id=None, show=False):
         return 0
 
 
+def fallback_command(home, *, gateway=None, model_id=None, clear=False):
+    with terminal_lock(home):
+        _, gateways, active = terminal_config(home)
+        if not gateways:
+            raise ValueError('请先运行 minis model 保存网关；一次性环境配置不支持备用模型。')
+        if gateway is not None:
+            matches = [i for i, row in enumerate(gateways) if row[0].casefold() == gateway.casefold()]
+            if len(matches) != 1:
+                raise ValueError('--gateway 必须唯一匹配一个已保存的网关名称。')
+            active = matches[0]
+        name, base, current, key = gateways[active]
+        if gateway_profile(gateways, name) is None:
+            raise ValueError('已保存的网关名称重复；无法绑定备用模型。')
+        provider = make_provider(base, current, key)
+        settings = terminal_fallbacks(home)
+        if model_id is not None:
+            if not valid_model_id(model_id) or model_id == current:
+                raise ValueError('备用模型 ID 无效或与默认模型相同。')
+            settings[name] = (provider.endpoint, model_id)
+        elif clear:
+            settings.pop(name, None)
+        if model_id is not None or clear:
+            save_history(home / FALLBACK_FILE, [[label, *data] for label, data in settings.items()])
+        endpoint, saved = settings.get(name, (None, None))
+        status = saved if endpoint == provider.endpoint else None
+        suffix = '（与默认模型相同，当前不重试）' if status == current else ''
+        label, = gateway_labels([gateways[active]])
+        print(f'{label} · 备用模型：{safe_display(status) if status else "未设置"}{suffix}')
+        return 0
+
+
 def session_model(home, provider, model_id):
     base = provider.endpoint.removesuffix('/chat/completions')
     key, current = provider.key, provider.model
+    profile = getattr(provider, 'gateway_profile', None)
     if not model_id:
         _, gateways, active = terminal_config(home)
         if gateways:
-            active = next((i for i, (_, url, _, secret) in enumerate(gateways)
-                           if (url.rstrip('/'), secret) == (base, key)), active)
+            active = next((i for i, (name, url, _, secret) in enumerate(gateways)
+                           if (name, url.rstrip('/'), secret) == (profile, base, key)), active)
             print(menu_text('切换网关后，后续请求会把会话上下文发送到所选网关。',
                             'Switching gateways sends conversation context to the selected gateway on later requests.'))
             index = pick_index(menu_text('当前会话：选择已配置网关', 'Current session: choose a saved gateway'),
                                gateway_labels(gateways), initial=active)
             if index is None:
                 return provider
-            _, url, saved_model, secret = gateways[index]
-            if (url.rstrip('/'), secret) != (base, key):
+            name, url, saved_model, secret = gateways[index]
+            if (name, url.rstrip('/'), secret) != (profile, base, key):
                 base, current, key = url, saved_model, secret
+            profile = gateway_profile(gateways, name)
         model_id = select_model(base, key, current)
         if model_id is None:
             return provider
     selected = make_provider(base, model_id, key, validate_model=True)
+    selected.gateway_profile = profile
     print(f'已切换当前会话模型：{model_id}（未改默认设置）。')
     return selected
 
@@ -633,25 +801,36 @@ def terminal_chat(home, *, demo=False, plain=False):
         pass  # Minimal Python builds still support a plain input prompt.
     with terminal_lock(home):
         provider = EchoDemo() if demo else terminal_provider(home)
+        try:
+            fallbacks = {} if demo else terminal_fallbacks(home)
+        except (OSError, ValueError, RecursionError):
+            print('备用模型配置不可读；本次会话不使用备用模型。', file=sys.stderr)
+            fallbacks = {}
         skill_dir = home / 'skills'
         if not skill_dir.exists() and not skill_dir.is_symlink():
             skill_dir = HERE / 'skills'
-        chat = Bot(home, 1, 'terminal', Terminal(), provider, skills_dir=skill_dir, channel='终端')
+        chat = Bot(home, 1, 'terminal', Terminal(), provider,
+                   skills_dir=skill_dir, channel='终端', features=not demo)
         view = TerminalView(plain=plain)
         view.welcome(chat, installed_version(), demo=demo)
+        commands = minis_input.DEFAULT_COMMANDS
+        if not demo:
+            commands += ('/sessions', '/session', '/title', '/history', '/export', '/actions',
+                         '/preview', '/approve', '/cancel', '/audit', '/trash', '/restore', '/skill')
         while True:
             try:
-                prompt = input(view.prompt(chat.provider, demo=demo)).strip()
+                prompt = minis_input.read_prompt(view.prompt(chat.provider, demo=demo),
+                                                 plain=view.plain, commands=commands)
             except EOFError:
                 print()
                 return 0
-            if prompt == '/exit':
-                return 0
             if not prompt:
                 continue
-            command, *args = prompt.split(maxsplit=1)
+            command, *args = prompt.split(maxsplit=1) if prompt.allow_commands else ('',)
+            if command == '/exit' and prompt == '/exit':
+                return 0
             if command == '/search':
-                print('离线演示不联网搜索。' if demo else search_web(args[0] if args else ''))
+                print('离线演示不联网搜索。' if demo else safe_display(search_web(args[0] if args else '')))
                 continue
             if command == '/model':
                 if demo:
@@ -665,8 +844,18 @@ def terminal_chat(home, *, demo=False, plain=False):
             if command == '/help' and not demo:
                 print('/model [模型 ID]：切换当前会话模型；/exit：退出终端。')
                 print('/search 关键词：只将关键词发送给 DuckDuckGo 搜索，不调用模型。')
+                print('同网关备用模型：退出后运行 minis model --help。')
+                if not view.plain:
+                    print('支持的终端可用 Ctrl+J 换行、Tab 补全命令，粘贴预览后按 Enter 发送。')
+                    print('模型可能在调用工具前输出文字；最终回答另起一行，已显示的最终回答不重复打印。')
             started = monotonic()
-            chat.handle(prompt)
+            fallback = gateway_fallback(chat.provider, fallbacks)
+            if view.plain or demo:
+                chat.handle(prompt, allow_commands=prompt.allow_commands, fallback_model=fallback,
+                            on_notice=print_reply if fallback else None,
+                            on_model=report_model if fallback else None)
+            else:
+                stream_turn(chat, prompt, fallback)
             if not command.startswith('/'):
                 view.elapsed = monotonic() - started
 
@@ -679,19 +868,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', choices=['update', 'model'])
     parser.add_argument('model_id', nargs='?', metavar='MODEL_ID', help='with model: save a specific ID')
-    parser.add_argument('--show', action='store_true', help='with model: show the saved default')
+    model_modes = parser.add_mutually_exclusive_group()
+    model_modes.add_argument('--show', action='store_true', help='with model: show the saved default')
+    model_modes.add_argument('--fallback', metavar='MODEL_ID', help='with model: set a same-gateway fallback')
+    model_modes.add_argument('--clear-fallback', action='store_true', help='with model: remove the fallback')
+    model_modes.add_argument('--show-fallback', action='store_true', help='with model: show the saved fallback')
+    parser.add_argument('--gateway', metavar='NAME', help='with fallback options: saved gateway (default: active)')
     parser.add_argument('--version', action='store_true')
     parser.add_argument('--check', action='store_true', help='with update: check only')
     parser.add_argument('--demo', action='store_true', help='offline terminal demo')
-    parser.add_argument('--plain', action='store_true', help='disable the terminal chat dashboard')
+    parser.add_argument('--plain', action='store_true', help='use simple line input and whole replies')
     parser.add_argument('--home', type=Path, help='private terminal state directory')
     args = parser.parse_args()
-    if args.command != 'model' and (args.show or args.model_id is not None):
-        parser.error('--show 和 MODEL_ID 仅适用于 model')
+    fallback_mode = args.fallback is not None or args.clear_fallback or args.show_fallback
+    if args.command != 'model' and (args.show or args.model_id is not None or fallback_mode or args.gateway is not None):
+        parser.error('模型配置选项仅适用于 model')
+    if args.gateway is not None and not fallback_mode:
+        parser.error('--gateway 仅适用于备用模型选项')
     if args.command and args.plain:
         parser.error('--plain 仅用于终端对话')
-    if args.command == 'model' and (args.demo or args.check or (args.show and args.model_id is not None)):
-        parser.error('model 不支持 --demo 或 --check，--show 不能和 MODEL_ID 一起使用')
+    if args.command == 'model' and (args.demo or args.check or ((args.show or fallback_mode) and args.model_id is not None)):
+        parser.error('model 不支持 --demo 或 --check，查看或设置备用模型时不能指定默认 MODEL_ID')
     try:
         version = installed_version()
         if args.version:
@@ -708,6 +905,9 @@ def main():
                 return terminal_chat(Path(tmp), demo=True, plain=args.plain)
         home = args.home or default_terminal_home()
         if args.command == 'model':
+            if fallback_mode:
+                return fallback_command(home.expanduser(), gateway=args.gateway,
+                                        model_id=args.fallback, clear=args.clear_fallback)
             return model_command(home.expanduser(), model_id=args.model_id, show=args.show)
         return terminal_chat(home.expanduser(), plain=args.plain)
     except KeyboardInterrupt:
