@@ -1,4 +1,4 @@
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import json
@@ -120,6 +120,48 @@ class InstallTest(unittest.TestCase):
         self.assertIn(['systemctl', 'start', UNIT], [call.args[0] for call in retry.call_args_list])
         self.assertFalse(recover_pending(self.root, run=retry))
 
+    def test_interrupted_same_version_reinstall_still_rolls_back(self):
+        from install import install, recover_pending, UNIT
+        ask = Mock(return_value=('123', 'https://api.example.com/v1', 'model',
+                                 '123:' + 'X' * 32, 'fixture-key'))
+        install(self.source, self.root, ask=ask, run=Mock())
+        app = self.root / 'opt/minis-linux/minis.py'
+        app.write_bytes(b'old code with the same VERSION')
+
+        def run(command, *, probe=False):
+            if command == ['systemctl', 'enable', UNIT]:
+                raise SystemExit(99)
+            return True
+
+        with self.assertRaises(SystemExit):
+            install(self.source, self.root, ask=ask, run=run)
+        self.assertNotEqual(app.read_bytes(), b'old code with the same VERSION')
+        self.assertEqual(recover_pending(self.root, run=Mock(return_value=True)), 'rolled-back')
+        self.assertEqual(app.read_bytes(), b'old code with the same VERSION')
+        ask.assert_called_once()
+
+    def test_interrupted_initial_install_rolls_back_and_keeps_credentials_for_retry(self):
+        from install import install, recover_pending, UNIT, MANAGED
+        ask = Mock(return_value=('123', 'https://api.example.com/v1', 'model',
+                                 '123:' + 'X' * 32, 'fixture-key'))
+
+        def run(command, *, probe=False):
+            if command == ['systemctl', 'enable', UNIT]:
+                raise SystemExit(99)
+            return not probe
+
+        with self.assertRaises(SystemExit):
+            install(self.source, self.root, ask=ask, run=run)
+        retry = Mock(return_value=True)  # enable may have taken effect before interruption
+        self.assertEqual(recover_pending(self.root, run=retry), 'rolled-back')
+        self.assertFalse(any((self.root / name).exists() for name in MANAGED))
+        commands = [call.args[0] for call in retry.call_args_list]
+        self.assertIn(['systemctl', 'disable', UNIT], commands)
+        self.assertNotIn(['systemctl', 'start', UNIT], commands)
+        install(self.source, self.root, ask=ask, run=Mock())
+        self.assertEqual((self.root / 'etc/minis-linux/model.key').read_text(), 'fixture-key\n')
+        ask.assert_called_once()
+
     def test_update_rechecks_installed_version_without_running_service_commands(self):
         from install import install
         ask = Mock(return_value=('123', 'https://api.example.com/v1', 'test/model',
@@ -194,20 +236,138 @@ class InstallTest(unittest.TestCase):
         version = self.root / 'opt/minis-linux/VERSION'
         version.write_text('0.0.0\n')
         sync = installer.sync_directory
-        cleanup_errors = []
+        journal = self.root / installer.PENDING
+        durable = None
+        unlinked = []
+        unlink = Path.unlink
+
+        def record_unlink(path, *args, **kwargs):
+            if path == journal:
+                unlinked.append(path.read_bytes())
+            return unlink(path, *args, **kwargs)
 
         def flaky_sync(path):
-            if path == version.parent and not (self.root / installer.PENDING).exists():
-                cleanup_errors.append(path)
+            nonlocal durable
+            if path == journal.parent and unlinked and not journal.exists():
                 raise OSError('fixture: directory sync failed during journal cleanup')
-            return sync(path)
+            sync(path)
+            if path == journal.parent and journal.exists():
+                durable = journal.read_bytes()
 
-        run = Mock(return_value=True)
-        with patch.object(installer, 'sync_directory', side_effect=flaky_sync):
-            installer.install(self.source, self.root, ask=ask, run=run)
-        self.assertEqual(len(cleanup_errors), 1)
+        with redirect_stderr(io.StringIO()), patch.object(Path, 'unlink', record_unlink), \
+                patch.object(installer, 'sync_directory', side_effect=flaky_sync):
+            installer.install(self.source, self.root, ask=ask, run=Mock(return_value=True))
+        self.assertIsNotNone(durable)
+        self.assertEqual(unlinked, [durable])
+        self.assertFalse(journal.exists())
+
+        # Model a power loss bringing back the last journal entry that was
+        # present before unlink, when the cleanup fsync did not succeed.
+        installer.atomic_write(journal, durable, 0o600)
+        run = Mock()
+        installer.recover_pending(self.root, run=run)
         self.assertEqual(version.read_bytes(), (self.source / 'VERSION').read_bytes())
-        self.assertNotIn(['systemctl', 'stop', installer.UNIT], [call.args[0] for call in run.call_args_list])
+        run.assert_not_called()
+        self.assertFalse(journal.exists())
+
+    def test_journal_unlink_error_does_not_undo_a_committed_same_version_reinstall(self):
+        import install as installer
+        ask = Mock(return_value=('123', 'https://api.example.com/v1', 'model',
+                                 '123:' + 'X' * 32, 'fixture-key'))
+        installer.install(self.source, self.root, ask=ask, run=Mock())
+        journal = self.root / installer.PENDING
+        app = journal.with_name('minis.py')
+        app.write_bytes(b'older build, same version')
+        unlink = Path.unlink
+
+        def fail_unlink(path, *args, **kwargs):
+            if path == journal:
+                raise PermissionError('fixture: journal unlink failed')
+            return unlink(path, *args, **kwargs)
+
+        with redirect_stderr(io.StringIO()), patch.object(Path, 'unlink', fail_unlink):
+            installer.install(self.source, self.root, ask=ask, run=Mock())
+        self.assertTrue(journal.is_file())
+        run = Mock()
+        self.assertEqual(installer.recover_pending(self.root, run=run), 'activated')
+        run.assert_not_called()
+        self.assertEqual(app.read_bytes(), (self.source / app.name).read_bytes())
+        self.assertFalse(journal.exists())
+
+    def test_initial_install_recovers_when_version_publication_is_interrupted(self):
+        import install as installer
+        for renamed in (False, True):
+            with self.subTest(renamed=renamed), tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                root = Path(tmp)
+                journal = root / installer.PENDING
+                version = journal.with_name('VERSION')
+                ask = Mock(return_value=('123', 'https://api.example.com/v1', 'model',
+                                         '123:' + 'X' * 32, 'fixture-key'))
+                replace = Path.replace
+
+                def interrupt_replace(path, target):
+                    if target == version:
+                        if renamed:
+                            replace(path, target)
+                        raise SystemExit(99)
+                    return replace(path, target)
+
+                with patch.object(Path, 'replace', interrupt_replace), self.assertRaises(SystemExit):
+                    installer.install(self.source, root, ask=ask, run=Mock())
+                self.assertEqual(version.exists(), renamed)
+                self.assertTrue(journal.exists())
+                run = Mock()
+                self.assertEqual(installer.recover_pending(root, run=run), 'activated')
+                run.assert_not_called()
+                self.assertEqual(version.read_bytes(), (self.source / 'VERSION').read_bytes())
+                self.assertEqual(journal.with_name('minis.py').read_bytes(), (self.source / 'minis.py').read_bytes())
+                self.assertFalse(journal.exists())
+
+    def test_activation_record_failure_recovers_the_journal_that_survived(self):
+        import install as installer
+        for renamed in (False, True):
+            with self.subTest(renamed=renamed), tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                root = Path(tmp)
+                ask = Mock(return_value=('123', 'https://api.example.com/v1', 'model',
+                                         '123:' + 'X' * 32, 'fixture-key'))
+                installer.install(self.source, root, ask=ask, run=Mock())
+                journal = root / installer.PENDING
+                app, version = journal.with_name('minis.py'), journal.with_name('VERSION')
+                app.write_bytes(b'old code')
+                version.write_bytes(b'0.0.0\n')
+                replace, sync = Path.replace, installer.sync_directory
+                journal_renames = []
+
+                def replace_journal(path, target):
+                    if target == journal:
+                        journal_renames.append(path)
+                        if len(journal_renames) == 2 and not renamed:
+                            raise OSError('fixture: activation record rename failed')
+                    return replace(path, target)
+
+                def sync_journal(path):
+                    if path == journal.parent and len(journal_renames) == 2:
+                        raise OSError('fixture: activation record fsync failed after rename')
+                    return sync(path)
+
+                with patch.object(Path, 'replace', replace_journal), \
+                        patch.object(installer, 'sync_directory', side_effect=sync_journal), \
+                        self.assertRaisesRegex(OSError, '--recover'):
+                    installer.install(self.source, root, ask=ask, run=Mock())
+                self.assertEqual(version.read_bytes(), b'0.0.0\n')
+                run = Mock(return_value=True)
+                result = installer.recover_pending(root, run=run)
+                if renamed:
+                    self.assertEqual(result, 'activated')
+                    self.assertEqual(version.read_bytes(), (self.source / 'VERSION').read_bytes())
+                    self.assertEqual(app.read_bytes(), (self.source / 'minis.py').read_bytes())
+                    run.assert_not_called()
+                else:
+                    self.assertEqual(result, 'rolled-back')
+                    self.assertEqual(version.read_bytes(), b'0.0.0\n')
+                    self.assertEqual(app.read_bytes(), b'old code')
+                    run.assert_any_call(['systemctl', 'start', installer.UNIT])
+                self.assertFalse(journal.exists())
 
     def test_rollback_starts_restored_unit_even_if_systemd_unloaded_it(self):
         from install import activate, UNIT
