@@ -168,6 +168,7 @@ class DeliveryV040Test(unittest.TestCase):
     def check_document_shutdown(self, phase, expected_status):
         script = dedent('''
             import json
+            import os
             import re
             import sys
             import threading
@@ -185,14 +186,16 @@ class DeliveryV040Test(unittest.TestCase):
 
             def finish(queue, fd, state, item, status):
                 if phase == 'audit':
-                    print('blocked in audit', flush=True)
+                    os.write(1, b'blocked in audit\\n')
                     assert sys.stdin.readline() == 'finish\\n'
                 return original_finish(queue, fd, state, item, status)
 
             def shutdown(stop, sig, frame):
                 original_signal(stop, sig, frame)
                 if phase == 'audit':
-                    print('audit signal recorded', flush=True)
+                    # SIGTERM can arrive before the preceding marker write
+                    # returns; avoid Python's buffered stdout in this handler.
+                    os.write(1, b'audit signal recorded\\n')
 
             def block():
                 print(f'blocked in {phase}', flush=True)
