@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Single-owner Telegram front end and shared conversation engine for Minis Linux."""
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import fcntl
 from hashlib import sha256
@@ -162,6 +162,10 @@ class TelegramError(Exception):
         self.retry_after = retry_after
         super().__init__(f'Telegram {method} 失败' + (f'（{code}）' if code else ''))
 
+    @property
+    def delivery_uncertain(self):
+        return not (type(self.code) is int and 400 <= self.code < 500 and self.code != 408)
+
 
 class Telegram:
     def __init__(self, token):
@@ -172,23 +176,31 @@ class Telegram:
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
         self.send_limit_lock = threading.Lock()
         self.send_after = 0.0
+        self._service_stop: _ServiceStop | None = None
+
+    def network_io(self):
+        """Allow SIGTERM to interrupt Telegram I/O on the polling thread only."""
+        if self._service_stop is not None and threading.current_thread() is threading.main_thread():
+            return self._service_stop.blocking()
+        return nullcontext()
 
     def request(self, method, body, timeout=15):
         req = Request(self.url + method, method='POST', data=json.dumps(body).encode(),
                       headers={'Content-Type': 'application/json'})
         status = None
-        try:
-            with self.opener.open(req, timeout=timeout) as resp:
-                raw = resp.read(1024 * 1024 + 1)
-        except HTTPError as exc:
-            status = exc.code
-            with exc:
-                try:
-                    raw = exc.read(8192)
-                except (OSError, http.client.HTTPException):
-                    raise TelegramError(method, status) from None
-        except (OSError, http.client.HTTPException):
-            raise TelegramError(method) from None
+        with self.network_io():
+            try:
+                with self.opener.open(req, timeout=timeout) as resp:
+                    raw = resp.read(1024 * 1024 + 1)
+            except HTTPError as exc:
+                status = exc.code
+                with exc:
+                    try:
+                        raw = exc.read(8192)
+                    except (OSError, http.client.HTTPException):
+                        raise TelegramError(method, status) from None
+            except (OSError, http.client.HTTPException):
+                raise TelegramError(method) from None
         try:
             data = json.loads(raw) if len(raw) <= 1024 * 1024 else None
         except (ValueError, RecursionError):
@@ -197,10 +209,10 @@ class Telegram:
             raise TelegramError(method, status)
         if status is None and data.get('ok') is True and 'result' in data:
             return data['result']
-        code = data.get('error_code')
+        code = data.get('error_code') if data.get('ok') is False else None
         parameters = data.get('parameters')
         retry = parameters.get('retry_after') if isinstance(parameters, dict) else None
-        raise TelegramError(method, status or (code if type(code) is int else None),
+        raise TelegramError(method, status or (code if type(code) is int and 400 <= code <= 599 else None),
                             max(0, min(retry, 3600)) if type(retry) is int else 0)
 
     def updates_since(self, offset):
@@ -211,16 +223,22 @@ class Telegram:
         return items
 
     def send(self, owner, text):
+        """Send once, returning the confirmed Telegram message ID or raising."""
         with self.send_limit_lock:
             if time.monotonic() < self.send_after:
                 raise TelegramError('sendMessage', 429)
         try:
-            self.request('sendMessage', {'chat_id': owner, 'text': text, 'link_preview_options': {'is_disabled': True}})
+            result = self.request('sendMessage', {'chat_id': owner, 'text': text,
+                                                 'link_preview_options': {'is_disabled': True}})
         except TelegramError as exc:
             if exc.code == 429:
                 with self.send_limit_lock:
                     self.send_after = max(self.send_after, time.monotonic() + max(1, exc.retry_after))
             raise
+        message_id = result.get('message_id') if isinstance(result, dict) else None
+        if type(message_id) is not int or message_id <= 0:
+            raise TelegramError('sendMessage')
+        return message_id
 
 
 def split_reply(text):
@@ -397,13 +415,15 @@ class Bot:
         # Telegram may choose an unrelated update ID after a long idle period.
         return saved[0] if 0 <= time.time() - saved[1] < 86400 else 0
 
-    def poll_once(self, dispatch=None, *, dispatch_media=None):
+    def poll_once(self, dispatch=None, *, dispatch_media=None, check_stop=None):
         offset = self.offset()
         updates = self.telegram.updates_since(offset)
         send_error = None
         valid = sorted((u for u in updates if isinstance(u, dict) and type(u.get('update_id')) is int
                         and u['update_id'] >= 0), key=lambda u: u['update_id'])
         for update in valid:
+            if check_stop is not None:
+                check_stop()
             seq = update['update_id']
             if seq < offset:
                 continue
@@ -604,6 +624,8 @@ class Bot:
             kind = 'attachment_send' if isinstance(matching, _Outgoing) else 'history_export'
             reply = ''
             try:
+                # An interrupted transport propagates through the audit as
+                # unknown, then exits the polling loop without sending a reply.
                 with queue.record_attempt(ident, kind):
                     reply = self._deliver_export(matching)
             except ActionAuditError as error:
@@ -1137,8 +1159,8 @@ class TaskControl:
                     if self._shutdown.is_set():
                         break
                     self.bot.send_reply(preview)
-            except TelegramError:
-                outcome = '回复发送失败'
+            except TelegramError as exc:
+                outcome = '回复发送状态不明' if exc.delivery_uncertain else '回复发送失败'
                 LOG.warning('任务回复未确认完整送达；不重放已发送或送达不明的内容')
         except TaskStopped:
             outcome = '已停止'
@@ -1220,11 +1242,12 @@ class _ServiceStop:
         if self.requested:
             raise _ServiceStopped
 
-    def interrupt(self, operation, *args, **kwargs):
+    @contextmanager
+    def blocking(self):
         try:
             self.interruptible = True
             self.check()
-            return operation(*args, **kwargs)
+            yield
         finally:
             self.interruptible = False
 
@@ -1247,21 +1270,21 @@ def serve(bot, *, tz='UTC', task_options=None, ready=None, stop=None):
             if stop is not None:
                 stop.check()
             try:
-                bot.poll_once(tasks.handle, dispatch_media=tasks.handle_media if bot.features else None)
+                bot.poll_once(tasks.handle, dispatch_media=tasks.handle_media if bot.features else None,
+                              check_stop=stop.check if stop is not None else None)
                 backoff = 2
             except TelegramError as exc:
                 if exc.code in (401, 404) or (exc.method == 'getUpdates' and exc.code == 409):
                     LOG.error('%s；请检查 Bot Token、Webhook 或重复运行的实例', exc)
                     return 78
                 if exc.method == 'sendMessage':
-                    LOG.warning('命令回复未送达；继续接收消息')
+                    LOG.warning('命令回复送达状态不明；继续接收消息' if exc.delivery_uncertain
+                                else '命令回复未送达；继续接收消息')
                     continue
                 delay = max(backoff, exc.retry_after)
                 LOG.warning('%s；%s 秒后继续轮询', exc, delay)
-                if stop is None:
+                with stop.blocking() if stop is not None else nullcontext():
                     time.sleep(delay)
-                else:
-                    stop.interrupt(time.sleep, delay)
                 backoff = min(backoff * 2, 60)
     finally:
         tasks.close()
@@ -1312,21 +1335,11 @@ def main():
             bot.offset()  # Validate mandatory persisted state before accepting readiness.
             with Workspace(bot.workspace):
                 pass
-            request = telegram.request
-            main_thread = threading.current_thread()
-
-            def service_request(method, body, timeout=15):
-                if threading.current_thread() is main_thread:
-                    return stop.interrupt(request, method, body, timeout=timeout)
-                return request(method, body, timeout=timeout)
-
-            # Only Bot API requests on this thread and backoff are async interruptible.
-            # The cursor, confirmations and shutdown itself must run normally.
-            telegram.request = service_request
+            telegram._service_stop = stop
             try:
                 return serve(bot, tz=tz, task_options=task_options, ready=notify_ready, stop=stop)
             finally:
-                telegram.request = request
+                telegram._service_stop = None
     except (KeyboardInterrupt, _ServiceStopped):
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error):

@@ -232,7 +232,7 @@ class ServiceV040Test(unittest.TestCase):
         tasks, chunks, attempts, waits = self.run_chunk_fixture(reject, lambda _: False)
         self.assertEqual(attempts, chunks[:2])
         self.assertEqual(waits, [])
-        self.assertIn('回复发送失败', tasks.last or '')
+        self.assertIn('回复发送状态不明', tasks.last or '')
 
     def test_excessive_cooldown_fails_without_waiting(self):
         def reject(method, _):
@@ -269,27 +269,31 @@ class ServiceV040Test(unittest.TestCase):
         # Exercise actual main/serve/signal handling in a disposable process.
         # All network I/O is replaced; DB and history writes are real.
         script = dedent('''
+            import json
             import sys
             import threading
             from datetime import datetime, timedelta, timezone
             from unittest.mock import Mock, patch
             from minis import save_history
             import minis_telegram as service
+            from test_delivery_v040 import Response, accepted
             from test_telegram import FakeProvider, message
 
             polling = threading.Event()
             reminder_sending = threading.Event()
             telegram = service.Telegram('2000:' + 'x' * 32)
 
-            def request(method, body, timeout=15):
+            def open_(req, **_):
+                method = req.full_url.rsplit('/', 1)[-1]
+                body = json.loads(req.data)
                 if method == 'getUpdates':
                     if body['offset'] == 0:
-                        return [message(1, 'fixture turn')]
+                        return Response(req, {'ok': True, 'result': [message(1, 'fixture turn')]})
                     polling.set()
                     threading.Event().wait(30)
                     raise AssertionError('poll should be interrupted by SIGTERM')
                 if method == 'sendMessage' and body['text'].startswith('已收到'):
-                    return {'message_id': 1}
+                    return Response(req, accepted())
                 if method == 'sendMessage' and body['text'].startswith('提醒（'):
                     reminder_sending.set()
                     threading.Event().wait(30)
@@ -316,7 +320,7 @@ class ServiceV040Test(unittest.TestCase):
 
             original_close = service.JobUI.close
             original_start = service.JobUI.start
-            telegram.request = request
+            telegram.opener.open = open_
             local_os = Mock(wraps=service.os)
             local_os.environ = {}
             local_os.geteuid.return_value = 65534

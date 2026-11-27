@@ -271,7 +271,7 @@ class TelegramTest(unittest.TestCase):
                             'name': 'skill_view', 'arguments': '{"name":"report"}'}}]}
                     result = {'choices': [{'message': msg}]}
                 elif self.path.endswith('/sendMessage'):
-                    result = {'ok': True, 'result': {}}
+                    result = {'ok': True, 'result': {'message_id': 1}}
                 else:
                     self.send_error(404)
                     return

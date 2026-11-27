@@ -218,7 +218,7 @@ def _telegram_token(telegram):
 
 def _read_download(telegram, url, limit, sizes):
     req = Request(url, method='GET', headers={'Accept-Encoding': 'identity'})
-    with telegram.opener.open(req, timeout=_HTTP_TIMEOUT) as response:
+    with telegram.network_io(), telegram.opener.open(req, timeout=_HTTP_TIMEOUT) as response:
         if (response.status != 200 or response.geturl() != url
                 or response.headers.get('Content-Encoding', 'identity').lower() != 'identity'):
             raise MediaError('Telegram 附件响应无效')
@@ -238,7 +238,7 @@ def _read_download(telegram, url, limit, sizes):
 def download_attachment(telegram, attachment):
     """Call getFile, then fetch bounded bytes from the official Telegram origin.
 
-    Pass the existing Telegram client (request/opener/url) and a descriptor
+    Pass the existing Telegram client and a descriptor
     from identify_attachment. TelegramError from getFile retains status and
     retry_after; content/transport errors use MediaError. No redirects/retries.
     """
@@ -334,31 +334,35 @@ def send_document(telegram, owner, filename, data):
         if time.monotonic() < telegram.send_after:
             raise MediaError('Telegram sendDocument 尚在冷却中', code=429)
     status, header, raw = None, None, b''
-    try:
-        with telegram.opener.open(req, timeout=_HTTP_TIMEOUT) as response:
-            if response.geturl() != req.full_url:
-                raise MediaError('Telegram sendDocument 响应无效')
-            header = response.headers.get('Retry-After')
-            raw = response.read(_HTTP_REPLY_LIMIT + 1)
-    except HTTPError as exc:
-        status = exc.code
-        with exc:
-            header = exc.headers.get('Retry-After')
-            try:
-                raw = exc.read(_HTTP_ERROR_LIMIT)
-            except (OSError, http.client.HTTPException):
-                pass
-    except (OSError, http.client.HTTPException):
-        raise MediaError('Telegram sendDocument 失败') from None
+    with telegram.network_io():
+        try:
+            with telegram.opener.open(req, timeout=_HTTP_TIMEOUT) as response:
+                if response.geturl() != req.full_url:
+                    raise MediaError('Telegram sendDocument 响应无效')
+                header = response.headers.get('Retry-After')
+                raw = response.read(_HTTP_REPLY_LIMIT + 1)
+        except HTTPError as exc:
+            status = exc.code
+            with exc:
+                header = exc.headers.get('Retry-After')
+                try:
+                    raw = exc.read(_HTTP_ERROR_LIMIT)
+                except (OSError, http.client.HTTPException):
+                    pass
+        except (OSError, http.client.HTTPException):
+            raise MediaError('Telegram sendDocument 失败') from None
     try:
         reply = json.loads(raw) if len(raw) <= _HTTP_REPLY_LIMIT else None
     except (ValueError, RecursionError):
         reply = None
     retry = 0
     if isinstance(reply, dict):
-        if status is None and reply.get('ok') is True and isinstance(reply.get('result'), dict):
-            return reply['result']
-        code = reply.get('error_code')
+        if status is None and reply.get('ok') is True:
+            result = reply.get('result')
+            message_id = result.get('message_id') if isinstance(result, dict) else None
+            if type(message_id) is int and message_id > 0:
+                return result
+        code = reply.get('error_code') if reply.get('ok') is False else None
         if status is None and type(code) is int and 100 <= code <= 599:
             status = code
         parameters = reply.get('parameters')

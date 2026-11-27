@@ -214,7 +214,7 @@ class TaskControlTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.client.send = original
         tasks.handle('/status')
-        self.assertIn('回复发送失败', self.client.sent[-1][1])
+        self.assertIn('回复发送状态不明', self.client.sent[-1][1])
 
     def test_service_shutdown_rejects_uncommitted_result(self):
         tasks = self.controller()
@@ -284,7 +284,7 @@ class TaskControlTest(unittest.TestCase):
                     data = {'ok': True, 'result': [u for u in updates if u['update_id'] >= body['offset']]}
                 elif self.path.endswith('/sendMessage'):
                     sent.append(body['text'])
-                    data = {'ok': True, 'result': {}}
+                    data = {'ok': True, 'result': {'message_id': len(sent)}}
                 elif self.path == '/v1/chat/completions':
                     model_started.set()
                     if not release_model.wait(4):
