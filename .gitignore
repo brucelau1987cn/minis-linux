@@ -1,0 +1,11 @@
+# Local credentials and Python artifacts
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local example data and custom in-repository state directories
+/demo-state/
+/sessions/
+/workspace/
