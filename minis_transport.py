@@ -64,6 +64,10 @@ class TelegramStream:
         self._units = 0
         self._message_id = None
 
+    @property
+    def has_preview(self):
+        return self._message_id is not None or bool(self._maybe_shown)
+
     def cancel(self):
         """Thread-safe, local only; a reserved/in-flight update may complete.
 

@@ -20,7 +20,11 @@ from minis_cli import ask_secret, installed_version, select_model, terminal_conf
 from minis_telegram import Telegram
 
 UNIT = 'minis-linux-telegram.service'
-APP_FILES = ('minis.py', 'minis_skills.py', 'minis_telegram.py', 'minis_search.py', 'minis_cli.py', 'VERSION')
+APP_FILES = (
+    'minis.py', 'minis_actions.py', 'minis_cli.py', 'minis_input.py', 'minis_job_ui.py', 'minis_media.py',
+    'minis_schedule.py', 'minis_search.py', 'minis_sessions.py', 'minis_skills.py',
+    'minis_telegram.py', 'minis_transport.py', 'minis_web.py', 'VERSION',
+)
 LAUNCHER = b'#!/bin/sh\n# Minis Linux managed launcher\nexec /usr/bin/python3 -EsB /opt/minis-linux/minis_cli.py "$@"\n'
 USER_LAUNCHER = b'#!/bin/sh\n# Minis Linux user launcher\n'
 SAMPLE = 'skills/weekly-report/SKILL.md'

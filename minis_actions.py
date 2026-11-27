@@ -618,6 +618,27 @@ class ActionQueue:
         finally:
             os.close(skills)
 
+    @contextmanager
+    def record_attempt(self, ident, kind):
+        """Record only metadata for a caller's already-authorized export or upload."""
+        if not _ACTION_ID.fullmatch(ident) or kind not in ('attachment_send', 'history_export'):
+            raise ActionError('Invalid audit metadata.')
+        item = {'binding': self._binding, 'id': ident, 'kind': kind}
+
+        def mark(status):
+            with self._locked() as (fd, state):
+                self._event(state, item, status)
+                self._save(fd, state)
+
+        mark('started')
+        try:
+            yield
+        except Exception:
+            mark('failed')
+            raise
+        else:
+            mark('applied')
+
     def audit(self, limit=50):
         if type(limit) is not int or not 1 <= limit <= _MAX_AUDIT:
             raise ActionError('Invalid audit limit.')

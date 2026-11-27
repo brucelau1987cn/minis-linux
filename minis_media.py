@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import selectors
+import stat
 import struct
 import subprocess
 import tempfile
@@ -272,6 +273,38 @@ def _pdf_header(data):
         raise MediaError('附件不是有效的 PDF 格式')
 
 
+def validated_document_mime(filename, data):
+    kind, mime = _format(filename)
+    if '"' in filename:
+        raise MediaError('附件文件名不能包含引号')
+    if kind == 'text':
+        parse_text(data)
+    elif kind == 'pdf':
+        _pdf_header(data)
+    else:
+        _verify_image(data, mime)
+    return mime
+
+
+def snapshot_document(workspace, filename):
+    """Freeze one bounded, validated top-level workspace file for approval."""
+    workspace.validate_name(filename)
+    kind, _ = _format(filename)
+    limit = _LIMITS[kind]
+    fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=workspace.fd)
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise MediaError('不发送特殊文件或硬链接')
+        _declared_size(before.st_size, limit)
+        data = stream.read(limit + 1)
+        after = os.fstat(stream.fileno())
+        if (before.st_size != len(data) or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns or after.st_nlink != 1):
+            raise MediaError('文件在预览时发生变化；请重新申请')
+    return data, validated_document_mime(filename, data)
+
+
 def send_document(telegram, owner, filename, data):
     """Send already approved bytes to the authorized owner, never read a path.
 
@@ -286,15 +319,7 @@ def send_document(telegram, owner, filename, data):
     token = _telegram_token(telegram)
     if type(owner) is not int or not 0 < owner < 2**63:
         raise MediaError('无效的 Telegram 所有者 ID')
-    kind, mime = _format(filename)
-    if '"' in filename:
-        raise MediaError('附件文件名不能包含引号')
-    if kind == 'text':
-        parse_text(data)
-    elif kind == 'pdf':
-        _pdf_header(data)
-    else:
-        _verify_image(data, mime)
+    mime = validated_document_mime(filename, data)
     # Browser-style UTF-8 filename; CR/LF, quotes, slashes and other unsafe
     # filename characters have been rejected. Do not add a parse_mode.
     boundary = secrets.token_hex(24)
