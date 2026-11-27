@@ -1,71 +1,61 @@
-# Minis Linux — CLI 与 Telegram 常驻助手
+# Minis Linux
 
-独立编写的 Linux 单用户 Agent，不是 OpenMinis 官方移植，也不依赖 Hermes 或 OpenClaw。Python 3.10+ 标准库即可运行。参考 OpenMinis 的「对话 + 工具 + 工作区」设计；没有复制其实现。
+**部署在自己 Linux 主机上的个人 AI 助手。**
 
-## Telegram 常驻模式
+从 Telegram 私聊或终端发消息，让 Minis 整理值班记录、起草周报，或按已安装的技能处理工作区里的资料。会话保存在运行 Minis 的主机上，重启后可以继续。模型由你选择：接入 CLIProxyAPI（CPA）或其他支持工具调用的 OpenAI 兼容服务。
 
-一个专用 Telegram Bot 私聊窗口，不用切换模式。Linux 用 systemd 常驻，不开入站端口，只接受指定的数字用户 ID。
+[下载稳定版](https://github.com/brucelau1987cn/minis-linux/releases/latest) · [功能说明](docs/features.md) · [部署手册](systemd/README.md)
 
-- **直接对话：** 发消息就能多轮聊天；重启后可接着聊。
-- **按需用技能：** 例如发「帮我整理一份周报」，模型可读取已安装的 `SKILL.md`，并使用只读工作区工具。发 `/skills` 查看已装技能。
-- **长期记忆：** 发「记住：周报用中文」保存偏好；「查看记忆」「忘记第 1 条」可管理。`/new` 清空本机聊天上下文，不删除长期记忆。
+## 主要功能
 
-**一键安装**（Linux、systemd 247+、Python 3.10+）：先用 @BotFather 创建一个专用 Bot，然后在终端执行：
+- **Telegram 私聊。** 用同一个窗口聊天、调用技能和管理记忆。只接收配置中指定账号的私聊，不需要开放入站端口。
+- **终端对话。** 输入 `minis` 进入行式交互界面。终端与 Telegram 分别保存会话、记忆和模型配置。
+- **技能与工作区。** Minis 按需读取本机安装的 `SKILL.md`。仓库自带周报技能；Telegram 和交互式终端只能列出和读取专用工作区顶层的文本文件，不执行技能脚本。
+- **可管理的记忆。** 发送「记住：周报用中文」保存一条偏好，再用「查看记忆」或「忘记第 1 条」管理。`/new` 清除本机对话上下文，保留长期记忆。
+- **Linux 常驻与更新。** 安装向导配置 systemd 服务，服务以非 root 身份运行。`minis update` 校验稳定版本签名后再安装，保留配置、技能和聊天数据。
+
+> Minis 在你的主机上保存状态并运行工具，模型推理仍由你配置的服务完成。对话、已保存的记忆和工具读取的内容可能发送给该服务。不要把密钥或敏感资料放进工作区、技能或记忆。
+
+## 快速开始
+
+### 不安装服务，先试终端
+
+下载并解压[稳定版](https://github.com/brucelau1987cn/minis-linux/releases/latest)，在解压目录里运行：
 
 ```bash
-git clone https://github.com/brucelau1987cn/minis-linux.git && cd minis-linux && sudo /usr/bin/python3 -EsB install.py
+python3 minis_cli.py --demo
 ```
 
-按向导填写 Telegram 数字 ID、Bot Token 和模型配置。安装完成后，在 Bot 私聊发 `/status`，再发一句话验证模型。服务器无需 GitHub Token。若 sudo 或堡垒机录制键盘输入，请用安装手册里的凭据文件方式，不要在向导里输入密钥。
+用 `/exit` 退出。演示使用固定的本地响应，不需要 API Key，不访问网络，也不修改正式会话。
 
-## 终端对话与版本更新
+### 部署到 Linux
 
-安装后可以从任意目录运行：
+需要 **Python 3.10+、systemd 247+**、系统 CA 证书，以及到 Telegram 和模型服务的出站连接。先通过 `@BotFather` 创建专用 Bot，准备好自己的 Telegram 数字用户 ID 和模型 API Key。下载 ZIP 或 tar.gz，并按发布页的 `SHA256SUMS` 核对下载包。进入解压目录后运行：
 
 ```bash
-minis                 # 打开交互式终端对话（行式界面）
-minis --demo          # 不联网、不用密钥，体验终端对话
-minis --version       # 显示当前版本
-minis update --check  # 只检查是否有新稳定版本
-minis update          # 安装新稳定版本，会请求 sudo
+sudo /usr/bin/python3 -EsB install.py
 ```
 
-终端和 Telegram 各有独立的会话、记忆和模型设置。首次打开终端对话时可填写模型配置，也可事先设置 `MINIS_BASE_URL`、`MINIS_MODEL`、`MINIS_API_KEY`。终端同样可以直接聊天、按需加载技能和管理记忆。
+按向导填写 Bot Token、模型 Base URL 和模型 ID 等信息。随后在 Bot 私聊发送 `/status` 检查消息收发，再发一句普通消息验证模型。录制键盘输入的终端请使用[凭据文件方式](systemd/README.md#一键部署推荐)。
 
-`minis update` 从本仓库选择更高的 `vX.Y.Z` 标签，跳过预发布版本，并用内置公钥验签后才安装。升级保留配置、凭据、技能和聊天数据；启动失败会尝试回退，安装被强制中断后可恢复。更多见 [systemd 安装手册](systemd/README.md)。只检查安装包可运行 `python3 install.py --check`，不启动服务。
-
-## 30 秒离线体验
+## 常用命令
 
 ```bash
-python3 minis.py --home ./demo-state --demo demo
-# 输入 y，创建 demo-state/workspace/note.md；不确认则不写入。
-python3 minis.py --home ./demo-state --history
+minis                 # 打开终端对话
+minis --version       # 查看已安装版本
+minis update --check  # 查找更新，不安装
+minis update          # 验签并安装较新的稳定版
+```
+
+Telegram 聊天内可用 `/help` 查看命令，`/skills` 列出已装技能。更详细的使用示例与权限说明见[功能说明](docs/features.md)。
+
+## 开发与验证
+
+项目使用 Python 标准库，无需安装第三方 Python 包。离线测试和安装器检查不会部署服务：
+
+```bash
 python3 -m unittest -v
+python3 -EsB install.py --check
 ```
 
-演示用固定的本地响应，不联网，不调用真实模型。重复确认创建同名文件也不会覆盖。
-
-## 接入 CPA 或其他 OpenAI 兼容 API
-
-在 Bash 里运行。把示例 URL 和模型 ID 换成你的实际值；不要填 CPA 管理密钥。
-
-```bash
-read -rsp 'API key: ' MINIS_API_KEY; printf '\n'
-export MINIS_API_KEY
-python3 minis.py --base-url https://api.example.com/v1 --model YOUR_MODEL_ID \
-  --session notes '列出工作区的文件'
-unset MINIS_API_KEY
-```
-
-调用 `/v1/chat/completions`。模型和网关需要支持标准工具调用；本地测试覆盖 HTTP 请求和工具结果回传，未连接真实 CPA。模型端只收到对话及已调用工具返回的内容，不会自动扫整台机器。使用同一个 `--session` 会在后续请求中重发该会话的历史，包括工具读出的文件内容；换模型或网关时使用新会话名，避免旧历史发给新服务。
-
-## 已实现与边界
-
-- `--session` 持久保存多轮对话；`--history` 输出选中会话的 JSON。会话记录独立，当前工作区仍由这些会话共享，不构成用户或会话隔离。
-- 提供列文件、读 UTF-8 文本、创建新文件三种工具。工具只操作专用工作区顶层，拒绝路径穿越、符号链接及对既有文件的覆盖。审阅写入预览后明确确认才创建文件。除离线演示外，非交互运行拒绝写入。
-- 建议普通 Linux 用户运行。默认工作区 `~/.local/share/minis-linux/workspace`，会话保存在同级 `sessions`，为明文。工作区不要放密钥或敏感文件，`--home` 应指定本人控制的私有目录。工作区限制不是 OS 级沙箱。
-- Telegram 不开放 Shell、写文件或执行技能脚本。对话、长期记忆与工具结果可能发给模型；不要记入密码或密钥，也不要在工作区或技能中放敏感文件。
-
-## 参考
-
-[OpenMinis README](https://github.com/OpenMinis/OpenMinis/blob/1a71df0f381cefde80bf912b723de6f9831bc177/README.md) · [移动端构建说明](https://github.com/OpenMinis/OpenMinis/blob/1a71df0f381cefde80bf912b723de6f9831bc177/BUILDING.md)
+Minis Linux 是独立实现，产品设计参考了 [OpenMinis](https://github.com/OpenMinis/OpenMinis) 的对话、技能和工作区思路，文档编写参考了 [Antigravity 功能总览](https://antigravity.google/docs/features/) 的分场景说明。它不是上述项目的官方移植，也不依赖 Hermes 或 OpenClaw 运行。
