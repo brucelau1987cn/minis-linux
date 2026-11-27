@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -107,6 +108,111 @@ class ActionsTest(unittest.TestCase):
         reopened.approve(reopened.stage_restore(trash_id)['id'])
         self.assertEqual(note.read_bytes(), b'\xff\x00\x01')
         self.assertEqual(reopened.trash_list(), [])
+
+    def _prepare_file_move(self, kind):
+        note = self.workspace / 'note'
+        # Ordinary file written outside the action queue, with no explicit sync.
+        note.write_bytes(b'fixture\n')
+        if kind == 'edit':
+            proposal = self.queue.stage('propose_edit_file', {'path': note.name, 'content': 'updated'})
+            return proposal['id'], note, self.queue.state_dir / ('trash-' + proposal['id']), proposal['id']
+        delete = self.queue.stage('propose_delete_file', {'path': note.name})
+        trash = self.queue.state_dir / ('trash-' + delete['id'])
+        if kind == 'restore':
+            self.queue.approve(delete['id'])
+            return self.queue.stage_restore(delete['id'])['id'], trash, note, delete['id']
+        return delete['id'], note, trash, delete['id']
+
+    def test_trash_and_restore_sync_verified_file_before_rename(self):
+        for kind in ('trash', 'restore'):
+            with self.subTest(kind=kind):
+                action_id, source, destination, _ = self._prepare_file_move(kind)
+                target = source.stat()
+                fsync = os.fsync
+                events = []
+
+                def observe_sync(fd):
+                    meta = os.fstat(fd)
+                    fsync(fd)
+                    if os.path.samestat(meta, target):
+                        events.append('file')
+                        self.assertTrue(os.path.samestat(source.stat(), meta))
+                        self.assertFalse(destination.exists())
+                    elif destination.exists() and stat.S_ISDIR(meta.st_mode):
+                        if os.path.samestat(meta, source.parent.stat()):
+                            events.append('source directory')
+                        elif os.path.samestat(meta, destination.parent.stat()):
+                            events.append('destination directory')
+
+                def finish(fd, state, proposal, status):
+                    self.assertEqual(status, 'applied')
+                    self.assertEqual(events[0:1], ['file'])
+                    self.assertIn('source directory', events[1:])
+                    self.assertIn('destination directory', events[1:])
+                    return original_finish(fd, state, proposal, status)
+
+                original_finish = self.queue._finish
+                with (patch('minis_actions.os.fsync', side_effect=observe_sync),
+                      patch.object(self.queue, '_finish', finish)):
+                    self.assertEqual(self.queue.approve(action_id)['status'], 'applied')
+                self.assertEqual(destination.read_bytes(), b'fixture\n')
+                self.assertTrue(os.path.samestat(destination.stat(), target))
+                self.assertFalse(source.exists())
+                self.assertEqual(self.open_queue().audit()[0]['status'], 'applied')
+
+    def test_file_sync_failure_leaves_original_in_place_and_consumes_approval(self):
+        for kind in ('trash', 'restore', 'edit'):
+            with self.subTest(kind=kind):
+                action_id, source, destination, trash_id = self._prepare_file_move(kind)
+                target = source.stat()
+                fsync = os.fsync
+
+                def fail_target_sync(fd):
+                    if os.path.samestat(os.fstat(fd), target):
+                        raise OSError(errno.EIO, 'fixture data sync failure')
+                    fsync(fd)
+
+                with patch('minis_actions.os.fsync', side_effect=fail_target_sync):
+                    with self.assertRaisesRegex(ActionError, 'sync the file'):
+                        self.queue.approve(action_id)
+                self.assertTrue(os.path.samestat(source.stat(), target))
+                self.assertEqual(source.read_bytes(), b'fixture\n')
+                self.assertFalse(destination.exists())
+                reopened = self.open_queue()
+                self.assertEqual([entry['status'] for entry in reopened.audit() if entry['id'] == action_id],
+                                 ['failed', 'started', 'staged'])
+                with self.assertRaises(ActionError):
+                    reopened.approve(action_id)
+                if kind == 'restore':
+                    self.assertIn(trash_id, [entry['id'] for entry in reopened.trash_list()])
+                    self.assertEqual(reopened.approve(reopened.stage_restore(trash_id)['id'])['status'], 'applied')
+                    self.assertEqual(destination.read_bytes(), b'fixture\n')
+                else:
+                    self.assertEqual(reopened.trash_list(), [])
+
+    def test_replaced_file_during_sync_is_not_moved(self):
+        for kind in ('trash', 'restore'):
+            with self.subTest(kind=kind):
+                action_id, source, destination, _ = self._prepare_file_move(kind)
+                original = source.stat()
+                replacement = self.home / 'replacement'
+                replacement.write_bytes(source.read_bytes())
+                replacement_meta = replacement.stat()
+                fsync = os.fsync
+
+                def replace_during_sync(fd):
+                    fsync(fd)
+                    if os.path.samestat(os.fstat(fd), original):
+                        replacement.replace(source)
+
+                with (patch('minis_actions.os.fsync', side_effect=replace_during_sync),
+                      patch('minis_actions._move_new', wraps=minis_actions._move_new) as move):
+                    with self.assertRaises(ActionError):
+                        self.queue.approve(action_id)
+                    move.assert_not_called()
+                self.assertTrue(os.path.samestat(source.stat(), replacement_meta))
+                self.assertFalse(destination.exists())
+                self.assertEqual(self.open_queue().audit()[0]['status'], 'failed')
 
     def test_memory_confirmation_and_metadata_only_audit(self):
         secret = 'token example-not-a-real-key'

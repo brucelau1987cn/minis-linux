@@ -146,16 +146,33 @@ def _regular(meta, limit):
             meta.st_gid, meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns]
 
 
-def _snapshot(fd, name, limit):
+def _snapshot(fd, name, limit, *, sync_target=None, restoring=False):
     before = _regular(os.stat(name, dir_fd=fd, follow_symlinks=False), limit)
     with os.fdopen(os.open(name, _READ_FLAGS, dir_fd=fd), 'rb') as stream:
-        if _regular(os.fstat(stream.fileno()), limit) != before:
+        file_fd = stream.fileno()
+        if _regular(os.fstat(file_fd), limit) != before:
             raise ActionError('Target changed; prepare a new proposal.')
         data = stream.read(limit + 1)
-        if (len(data) != before[6] or _regular(os.fstat(stream.fileno()), limit) != before
+        if (len(data) != before[6] or _regular(os.fstat(file_fd), limit) != before
                 or _regular(os.stat(name, dir_fd=fd, follow_symlinks=False), limit) != before):
             raise ActionError('Target changed; prepare a new proposal.')
-    return [sha256(data).hexdigest(), *before], data
+        target = [sha256(data).hexdigest(), *before]
+        if sync_target is not None:
+            # The earlier move to trash changed ctime, but all other fields
+            # (including the digest) still have to match the approved target.
+            if target[:-1] != sync_target[:-1] or (not restoring and target[-1] != sync_target[-1]):
+                raise ActionError('Trash file changed; restore was refused.' if restoring else
+                                  'Target changed; prepare a new proposal.')
+            try:
+                os.fsync(file_fd)
+            except OSError:
+                raise ActionError('Could not sync the file; no move was attempted.') from None
+            # fsync may take time. Check both the verified inode and the name
+            # again before allowing a rename, now including the current ctime.
+            if (_regular(os.fstat(file_fd), limit) != before
+                    or _regular(os.stat(name, dir_fd=fd, follow_symlinks=False), limit) != before):
+                raise ActionError('Target changed; prepare a new proposal.')
+    return target, data
 
 
 def quote_preview(text):
@@ -607,12 +624,7 @@ class ActionQueue:
             name = _name(p['name'])
             if kind == 'restore_file':
                 source = 'trash-' + p['trash_id']
-                target, _ = _snapshot(fd, source, _TRASH_FILE_LIMIT)
-                if target[:-1] != p['target'][:-1]:
-                    raise ActionError('Trash file changed; restore was refused.')
-                _move_new(fd, source, workspace, name)
-                os.fsync(workspace)
-                os.fsync(fd)
+                self._move_target(fd, source, workspace, name, _TRASH_FILE_LIMIT, p['target'], restoring=True)
             elif kind == 'propose_create_file':
                 with _temp_file(workspace, '.minis-file-' + p['id'], p['detail'].encode('utf-8')) as temp:
                     _move_new(workspace, temp, workspace, name)
@@ -636,31 +648,32 @@ class ActionQueue:
                 raise ActionError('Unrecognized pending action.')
 
     @staticmethod
-    def _put_back(fd, source, workspace, name):
+    def _put_back(src_fd, src, dst_fd, dst):
         try:
-            _move_new(fd, source, workspace, name)
+            _move_new(src_fd, src, dst_fd, dst)
         except FileExistsError:
             # Preserve both entries. Never replace a concurrent writer's file.
             return
-        os.fsync(workspace)
-        os.fsync(fd)
+        os.fsync(dst_fd)
+        os.fsync(src_fd)
 
     def _stash(self, fd, workspace, name, p, limit):
-        target, _ = _snapshot(workspace, name, limit)
-        if target != p['target']:
-            raise ActionError('Target changed; prepare a new proposal.')
         source = 'trash-' + p['id']
-        _move_new(workspace, name, fd, source)
+        self._move_target(workspace, name, fd, source, limit, p['target'])
+        return source
+
+    def _move_target(self, src_fd, src, dst_fd, dst, limit, expected, *, restoring=False):
+        target, _ = _snapshot(src_fd, src, limit, sync_target=expected, restoring=restoring)
+        _move_new(src_fd, src, dst_fd, dst)
         try:
-            moved, _ = _snapshot(fd, source, limit)
+            moved, _ = _snapshot(dst_fd, dst, limit)
             if moved[:-1] != target[:-1]:
                 raise ActionError('Target changed; prepare a new proposal.')
         except (ActionError, OSError):
-            self._put_back(fd, source, workspace, name)
+            self._put_back(dst_fd, dst, src_fd, src)
             raise
-        os.fsync(fd)
-        os.fsync(workspace)
-        return source
+        os.fsync(dst_fd)
+        os.fsync(src_fd)
 
     def _check_skill_name(self, name):
         for root in self.skill_roots:
