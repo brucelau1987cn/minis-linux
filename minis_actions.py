@@ -57,6 +57,18 @@ class ActionError(ValueError):
     """User-safe rejection (never includes payloads, raw paths or callback errors)."""
 
 
+class ActionOutcomeUnknown(ActionError):
+    """The effect may have taken place, but could not be confirmed."""
+
+
+class ActionAuditError(ActionError):
+    """The attempt was consumed but its final audit write failed."""
+
+    def __init__(self, status):
+        self.status = status
+        super().__init__('Final audit update could not be confirmed. Do not retry this approval.')
+
+
 def _path(value):
     path = Path(value).absolute()
     if path.anchor != '/' or '..' in path.parts:
@@ -146,10 +158,18 @@ def _snapshot(fd, name, limit):
     return [sha256(data).hexdigest(), *before], data
 
 
+def quote_preview(text):
+    """A reversible, single-line JSON string with no invisible controls."""
+    value = json.dumps(text, ensure_ascii=False)
+    return ''.join(ch if ch.isprintable() else json.dumps(ch)[1:-1] for ch in value)
+
+
 def _diff(before, after):
     def lines_with_lf(text):
         *lines, tail = text.split('\n')
-        return [line + '\n' for line in lines] + ([tail] if tail else [])
+        # Encode the actual line ending as data; the final LF is diff framing.
+        rows = [line + '\n' for line in lines] + ([tail] if tail else [])
+        return [quote_preview(line) + '\n' for line in rows]
 
     old, new = lines_with_lf(before), lines_with_lf(after)
     if len(old) + len(new) <= 2048:
@@ -158,8 +178,8 @@ def _diff(before, after):
         # Avoid quadratic matching on adversarial inputs. Show a full replacement hunk.
         lines = ['--- before\n', '+++ after\n', f'@@ -1,{len(old)} +1,{len(new)} @@\n',
                  *('-' + line for line in old), *('+' + line for line in new)]
-    return ''.join(line if line.endswith('\n') else line + '\n\\ No newline at end of file\n'
-                   for line in lines)
+    return ''.join(line[0] + ' ' + line[1:] if line.startswith((' "', '-"', '+"')) else line
+                   for line in lines).removesuffix('\n')
 
 
 def _skill(args):
@@ -205,6 +225,27 @@ def _temp_file(fd, name, data):
                 pass
 
 
+def publish_export(directory, filename, data):
+    """Publish a local export in an owner-only directory outside the workspace."""
+    _name(filename)
+    published = False
+    try:
+        with _directory(_path(directory), create_leaf=True) as fd:
+            meta = os.fstat(fd)
+            if meta.st_uid != os.geteuid() or meta.st_mode & 0o077:
+                raise ActionError('本机导出目录权限不安全；未导出。')
+            with _temp_file(fd, '.export-' + secrets.token_hex(16) + '.tmp', data) as temp:
+                _move_new(fd, temp, fd, filename)
+                published = True
+                os.fsync(fd)
+    except OSError as error:
+        if published:
+            raise ActionOutcomeUnknown('无法确认本机导出已持久保存；请检查导出目录。不会重试。') from None
+        if isinstance(error, FileExistsError):
+            raise ActionError('本机导出目标已存在；未覆盖文件。') from None
+        raise ActionError('无法写入本机导出；未发布文件。') from None
+
+
 class ActionQueue:
     """Scoped durable proposals, serialized across processes sharing a state directory.
 
@@ -225,8 +266,13 @@ class ActionQueue:
     mode-0600 files, not in-place changes. Edit/delete need private state on the
     workspace filesystem; unsupported atomic renames fail without a copy fallback.
 
+    `skill_roots` are configured and bundled catalogs, checked by literal name
+    rather than the bounded model catalog. Their entries take priority over
+    the writable overlay when resolving a skill.
+
     save_memory(text) runs under the lock; do not re-enter the queue. Return False
-    or raise to report a failure; any other return means success. The parent is
+    for rejection; return success only once the file and directory are durable.
+    An exception means the outcome could not be confirmed. The parent is
     responsible for serializing direct memory commands with this callback.
 
     Approval claims are persisted before application. A lone 'started' means
@@ -238,9 +284,12 @@ class ActionQueue:
     of trash; only a local operator may archive or remove it outside the queue.
     """
 
-    def __init__(self, home, workspace, skills_dir, save_memory=None, *, scope='', ttl_seconds=900):
+    def __init__(self, home, workspace, skills_dir, save_memory=None, *, scope='', ttl_seconds=900,
+                 skill_roots=()):
         self.state_dir = _path(home) / '.minis-actions'
         self.workspace, self.skills_dir = _path(workspace), _path(skills_dir)
+        self.skill_roots = tuple(root for root in dict.fromkeys(map(_path, skill_roots))
+                                 if root != self.skills_dir)
         if any(a == b or a in b.parents or b in a.parents for a, b in
                ((self.state_dir, self.workspace), (self.state_dir, self.skills_dir),
                 (self.workspace, self.skills_dir))):
@@ -339,9 +388,26 @@ class ActionQueue:
 
     @staticmethod
     def _view(p, *, detail=True):
-        view = {key: p[key] for key in ('id', 'kind', 'expires_at', 'summary')}
+        view = {key: p[key] for key in ('id', 'kind', 'expires_at')}
+        kind = p['kind']
+        if kind == 'propose_memory':
+            view['summary'] = 'Save one long-term memory item'
+        else:
+            operation = {'propose_skill': 'Install skill', 'propose_create_file': 'Create file',
+                         'propose_edit_file': 'Edit file', 'propose_delete_file': 'Move file to private trash',
+                         'restore_file': 'Restore file from private trash'}[kind]
+            view['summary'] = f'{operation}: {quote_preview(p["name"])}'
         if detail:
-            view['detail'] = p['detail']
+            if kind == 'propose_edit_file':
+                # Older queued proposals stored only a display diff. Do not
+                # re-arm them with a lossy rendering of that legacy diff.
+                if 'quoted_diff' not in p:
+                    raise ActionError('Preview format has changed; cancel and prepare a new edit proposal.')
+                view['detail'] = p['quoted_diff']
+            elif kind in ('propose_delete_file', 'restore_file'):
+                view['detail'] = f'{p["target"][7]} bytes'
+            else:
+                view['detail'] = quote_preview(p['detail'])
         return view
 
     def stage(self, tool_name, args):
@@ -354,9 +420,10 @@ class ActionQueue:
                 if (self.save_memory is None or not 0 < len(text) <= _MEMORY_LIMIT
                         or len(text.splitlines()) != 1):
                     raise ActionError('Memory is unavailable or the item is not one bounded line.')
-                data = {'summary': 'Save one long-term memory item', 'detail': text}
+                data = {'detail': text}
             elif tool_name == 'propose_skill':
                 name, document = _skill(args)
+                self._check_skill_name(name)
                 with _directory(self.skills_dir.parent) as parent:
                     try:
                         skills = _open_dir(parent, self.skills_dir.name)
@@ -368,7 +435,7 @@ class ActionQueue:
                             root = _identity(skills)
                         finally:
                             os.close(skills)
-                    data = {'summary': f'Install skill {name!r}', 'detail': document,
+                    data = {'detail': document,
                             'name': name, 'root': root, 'parent': _identity(parent)}
             else:
                 data = self._prepare_file(tool_name, args)
@@ -380,16 +447,16 @@ class ActionQueue:
             data = {'root': _identity(workspace), 'name': name}
             if kind == 'propose_create_file':
                 _no_entry(workspace, name)
-                return dict(data, summary=f'Create {name!r}', detail=_text(args['content']))
+                return dict(data, detail=_text(args['content']))
             limit = FILE_LIMIT if kind == 'propose_edit_file' else _TRASH_FILE_LIMIT
             target, old = _snapshot(workspace, name, limit)
             data['target'] = target
             if kind == 'propose_delete_file':
-                return dict(data, summary=f'Move {name!r} to private trash', detail=f'{len(old)} bytes')
+                return data
             before, content = _text(old.decode('utf-8')), _text(args['content'])
             if before == content:
                 raise ActionError('The proposed text is unchanged.')
-            return dict(data, summary=f'Edit {name!r}', detail=_diff(before, content), content=content)
+            return dict(data, quoted_diff=_diff(before, content), content=content)
 
     def _stage(self, fd, state, kind, data):
         if len(state['pending']) >= _MAX_PENDING:
@@ -443,8 +510,7 @@ class ActionQueue:
                 raise ActionError('No recoverable file with that ID in this session.')
             name = _name(item['name'])
             _no_entry(workspace, name)
-            return self._stage(fd, state, 'restore_file', dict(item, trash_id=trash_id,
-                               summary=f'Restore {name!r} from private trash', detail=f'{item["target"][7]} bytes'))
+            return self._stage(fd, state, 'restore_file', dict(item, trash_id=trash_id))
 
     @staticmethod
     def _trash_exists(fd, key, item):
@@ -499,18 +565,25 @@ class ActionQueue:
                     raise ActionError('Approval expired before application.')
                 self._apply(fd, p)
             except (OSError, ActionError) as error:
-                self._event(state, p, 'failed')
-                self._save(fd, state)
+                status = 'unknown' if isinstance(error, (OSError, ActionOutcomeUnknown)) else 'failed'
+                self._finish(fd, state, p, status)
                 if isinstance(error, ActionError):
                     raise
-                raise ActionError('Action did not finish; inspect workspace and trash before retrying.') from None
+                raise ActionOutcomeUnknown('Action did not finish; inspect workspace and trash. '
+                                           'This approval will not be retried.') from None
             if p['kind'] == 'propose_edit_file':
                 del state['trash'][action_id]
             elif p['kind'] == 'restore_file':
                 del state['trash'][p['trash_id']]
-            entry = self._event(state, p, 'applied')
+            return self._finish(fd, state, p, 'applied')
+
+    def _finish(self, fd, state, item, status):
+        try:
+            entry = self._event(state, item, status)
             self._save(fd, state)
-            return entry
+        except (OSError, ActionError) as error:
+            raise ActionAuditError(status) from error
+        return entry
 
     def _apply(self, fd, p):
         kind = p['kind']
@@ -520,7 +593,8 @@ class ActionQueue:
             try:
                 result = self.save_memory(p['detail'])
             except Exception:
-                raise ActionError('Memory save did not finish; check memory before retrying.') from None
+                raise ActionOutcomeUnknown('Memory save could not be confirmed; check memory. '
+                                           'This approval will not be retried.') from None
             if result is False:
                 raise ActionError('The memory store declined the item.')
             return
@@ -546,6 +620,8 @@ class ActionQueue:
             elif kind == 'propose_delete_file':
                 self._stash(fd, workspace, name, p, _TRASH_FILE_LIMIT)
             elif kind == 'propose_edit_file':
+                if 'quoted_diff' not in p:
+                    raise ActionError('Preview format has changed; prepare a new edit proposal.')
                 with _temp_file(workspace, '.minis-file-' + p['id'], p['content'].encode('utf-8')) as temp:
                     source = self._stash(fd, workspace, name, p, FILE_LIMIT)
                     try:
@@ -586,10 +662,21 @@ class ActionQueue:
         os.fsync(workspace)
         return source
 
+    def _check_skill_name(self, name):
+        for root in self.skill_roots:
+            try:
+                with _directory(root) as fd:
+                    _no_entry(fd, name)
+            except FileNotFoundError:
+                continue
+            except ActionError:
+                raise ActionError('Skill name is already reserved by a configured or bundled catalog.') from None
+
     def _install_skill(self, p):
         name = p['name']
         if not SLUG.fullmatch(name):
             raise ActionError('Invalid skill name.')
+        self._check_skill_name(name)
         with _directory(self.skills_dir.parent) as parent:
             if _identity(parent) != p['parent']:
                 raise ActionError('Skill directory changed; prepare a new proposal.')
@@ -620,24 +707,37 @@ class ActionQueue:
 
     @contextmanager
     def record_attempt(self, ident, kind):
-        """Record only metadata for a caller's already-authorized export or upload."""
+        """Audit a caller's single attempt; use ActionOutcomeUnknown for ambiguous effects."""
         if not _ACTION_ID.fullmatch(ident) or kind not in ('attachment_send', 'history_export'):
             raise ActionError('Invalid audit metadata.')
         item = {'binding': self._binding, 'id': ident, 'kind': kind}
 
-        def mark(status):
-            with self._locked() as (fd, state):
-                self._event(state, item, status)
-                self._save(fd, state)
+        def finish(status):
+            try:
+                with self._locked() as (fd, state):
+                    self._finish(fd, state, item, status)
+            except ActionAuditError:
+                raise
+            except ActionError as error:
+                raise ActionAuditError(status) from error
 
-        mark('started')
+        try:
+            with self._locked() as (fd, state):
+                self._event(state, item, 'started')
+                self._save(fd, state)
+        except ActionError:
+            raise ActionError('Could not record the start of the operation; no effect was attempted. '
+                              'This approval will not be retried.') from None
         try:
             yield
+        except ActionError as error:
+            finish('unknown' if isinstance(error, ActionOutcomeUnknown) else 'failed')
+            raise
         except Exception:
-            mark('failed')
+            finish('unknown')
             raise
         else:
-            mark('applied')
+            finish('applied')
 
     def audit(self, limit=50):
         if type(limit) is not int or not 1 <= limit <= _MAX_AUDIT:

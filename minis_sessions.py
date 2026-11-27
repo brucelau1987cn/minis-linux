@@ -218,6 +218,9 @@ class Sessions:
                         info = os.fstat(store)
                         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
                             raise SessionError('会话目录权限不安全。')
+                    if create:
+                        # Also sync an existing directory after an interrupted first creation.
+                        os.fsync(parent)
                     yield parent, store
                 finally:
                     if store is not None:
@@ -234,6 +237,9 @@ class Sessions:
         try:
             data = _decode(_read_at(store, INDEX, MAX_INDEX_BYTES, private=True))
         except FileNotFoundError:
+            with os.scandir(store) as entries:
+                if next(entries, None) is not None:
+                    raise SessionError('会话目录非空但索引缺失；未重置旧会话。')
             return _Index()
         if (not isinstance(data, dict) or data.keys() != {'version', 'active', 'titles'}
                 or type(data['version']) is not int or data['version'] != 1
@@ -256,6 +262,7 @@ class Sessions:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp, INDEX, src_dir_fd=store, dst_dir_fd=store)
+            os.fsync(store)
         finally:
             try:
                 os.unlink(temp, dir_fd=store)

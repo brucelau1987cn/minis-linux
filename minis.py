@@ -469,18 +469,28 @@ def clean_history_temps(path):
 
 
 def save_history(path, data):
-    from tempfile import NamedTemporaryFile
+    from secrets import token_hex
     encoded = json.dumps(data, ensure_ascii=True, indent=2).encode()
     if len(encoded) > HISTORY_LIMIT:
         raise ValueError('会话达到存储上限，请新建会话')
-    with NamedTemporaryFile(dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp', delete=False) as f:
-        temp = Path(f.name)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        temp = f'.{path.name}.{token_hex(8)}.tmp'
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
         try:
-            f.write(encoded)
-            f.close()
-            temp.replace(path)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(encoded)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
         finally:
-            temp.unlink(missing_ok=True)
+            try:
+                os.unlink(temp, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(parent)
 
 
 def normalize_reply(raw):

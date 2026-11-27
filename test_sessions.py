@@ -82,6 +82,39 @@ class SessionsTests(unittest.TestCase):
         self.assertEqual(read_history(self.legacy)[0]['content'], 'original')
         self.assertEqual(read_history(named)[0]['content'], 'named history')
 
+    def test_missing_index_in_populated_store_fails_closed(self):
+        sessions = Sessions(self.legacy)
+        sessions.create('named')
+        named = sessions.active_path
+        self.write(named, 'keep this')
+        index = named.parent / 'index.json'
+        index.unlink()
+        reopened = Sessions(self.legacy)
+        for use in (lambda: reopened.active_path, reopened.list, reopened.create,
+                    lambda: reopened.switch(1), lambda: reopened.title('new title'),
+                    lambda: reopened.search('keep'), reopened.export):
+            with self.subTest(use=use), self.assertRaises(SessionError):
+                use()
+        self.assertFalse(index.exists())
+        self.assertEqual(read_history(named)[0]['content'], 'keep this')
+
+    def test_create_syncs_store_entry_and_index(self):
+        sessions = Sessions(self.legacy)
+        synced = []
+        sync = os.fsync
+
+        def track(fd):
+            synced.append(Path(os.readlink(f'/proc/self/fd/{fd}')))
+            sync(fd)
+
+        with patch('minis_sessions.os.fsync', side_effect=track):
+            sessions.create()
+        store = sessions.active_path.parent
+        self.assertEqual(synced[0], self.root)
+        self.assertEqual(synced[1].parent, store)
+        self.assertTrue(synced[1].name.startswith('.index.json.'))
+        self.assertEqual(synced[2:], [store])
+
     def test_failed_replace_preserves_index_and_cleans_temporary_file(self):
         sessions = Sessions(self.legacy)
         sessions.create('original')

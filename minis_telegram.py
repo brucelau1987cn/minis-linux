@@ -24,7 +24,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from minis import (READ_ONLY_TOOLS, TOOL_ARGUMENT_LIMIT, ModelHTTPError, NoRedirect, Provider, Workspace,
                    accepts_keyword, clean_history_temps, complete_turn, current_time, normalize_reply, read_history,
                    safe_display, save_history, transient_model_failure, valid_unicode, workspace_disk)
-from minis_actions import ACTION_TOOLS, ActionError, ActionQueue
+from minis_actions import (ACTION_TOOLS, ActionAuditError, ActionError, ActionOutcomeUnknown, ActionQueue,
+                           publish_export, quote_preview)
 from minis_job_ui import JobUI
 from minis_media import MAX_TEXT_BYTES, MediaError, send_document, send_markdown, snapshot_document
 from minis_sessions import EXPORT_REMINDER, SessionError, Sessions
@@ -239,11 +240,15 @@ class Bot:
         self.workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.state = self.home / 'telegram'
         self.state.mkdir(mode=0o700, exist_ok=True)
+        if features:
+            # Persist the state directory entry before relying on fsyncs within it.
+            with Workspace(self.home) as state_parent:
+                os.fsync(state_parent.fd)
         self.cursor = self.state / f'bot-{bot_id}.cursor.json'
         self.history = self.state / f'bot-{bot_id}-owner-{owner}.json'
         self.memory = self.state / f'bot-{bot_id}-owner-{owner}.memory.json'
         self.sessions = Sessions(self.history) if features else None
-        self.skills_dir = Path(skills_dir) if skills_dir is not None else self.home / 'skills'
+        self.skills_dir = Path(skills_dir).absolute() if skills_dir is not None else self.home / 'skills'
         self.skill_overlay = self.home / 'skills'
         self._receipts_lock = threading.Lock()
         self._receipts: dict[tuple[Path, str], float] = {}
@@ -273,8 +278,10 @@ class Bot:
 
     def skill_catalog(self):
         """Return the merged bounded skill catalog and whether any root failed."""
-        roots = ((self.skill_overlay, self.skills_dir, _BUNDLED_SKILLS) if self.features
-                 else (self.skills_dir,))
+        roots = (self.skills_dir,)
+        if self.features:
+            roots = (tuple(root for root in (self.skills_dir, _BUNDLED_SKILLS) if root != self.skill_overlay)
+                     + (self.skill_overlay,))
         skipped, catalogs = False, []
         for root in dict.fromkeys(roots):
             try:
@@ -310,6 +317,8 @@ class Bot:
         if not item or len(item) > MAX_MEMORY_CHARS:
             return False, f'请输入 1–{MAX_MEMORY_CHARS} 个字符的单条记忆。'
         if item in entries.values():
+            # An earlier write may have been visible without a successful fsync.
+            save_history(self.memory, [next_id, list(entries.items())])
             return True, '这条已经记住了。'
         if len(entries) == MAX_MEMORIES:
             return False, '记忆已满，先发「查看记忆」，再忘掉不需要的条目。'
@@ -457,6 +466,7 @@ class Bot:
     def _queue(self, path):
         return ActionQueue(self.home, self.workspace, self.skill_overlay,
                            lambda text: self._remember(text)[0],
+                           skill_roots=(self.skills_dir, _BUNDLED_SKILLS),
                            scope=sha256(os.fsencode(path) + b'\0' + self.channel.encode()).hexdigest())
 
     def _feature_command(self, text):
@@ -522,7 +532,7 @@ class Bot:
         if text == '/actions':
             lines = [f'{a["id"]} · {a["summary"]}' for a in queue.list()]
             if isinstance(matching, _Outgoing):
-                lines.append(f'{matching.ident} · 发送工作区附件 {matching.filename}')
+                lines.append(f'{matching.ident} · 发送工作区附件 {quote_preview(matching.filename)}')
             elif matching is not None:
                 lines.append(f'{matching.ident} · 导出会话 {matching.session_id}')
             return safe_display('\n'.join(lines)) or '此会话没有待确认操作。'
@@ -530,7 +540,7 @@ class Bot:
             return ('\n'.join(f'{a["at"]} · {a["kind"]} · {a["status"]} · {a["id"]}'
                               for a in queue.audit()) or '此会话没有操作记录。')
         if text == '/trash':
-            return safe_display('\n'.join(f'{a["id"]} · {a["path"]} · {a["status"]} · {a["size"]} bytes'
+            return safe_display('\n'.join(f'{a["id"]} · {quote_preview(a["path"])} · {a["status"]} · {a["size"]} bytes'
                                           for a in queue.trash_list())) or '此会话没有可恢复的文件。'
         match = _ACTION_COMMAND.fullmatch(text)
         if match is None:
@@ -557,10 +567,24 @@ class Bot:
             assert matching is not None
             self._export = None  # Claim before attempting delivery; never auto-retry.
             kind = 'attachment_send' if isinstance(matching, _Outgoing) else 'history_export'
-            with queue.record_attempt(ident, kind):
-                return self._deliver_export(matching)
-        queue.approve(ident)
+            reply = ''
+            try:
+                with queue.record_attempt(ident, kind):
+                    reply = self._deliver_export(matching)
+            except ActionAuditError as error:
+                return (reply + ' ' + self._audit_warning(error) if reply
+                        else self._audit_warning(error))
+            return reply
+        try:
+            queue.approve(ident)
+        except ActionAuditError as error:
+            return self._audit_warning(error)
         return '已执行已确认操作。'
+
+    @staticmethod
+    def _audit_warning(error):
+        outcome = {'applied': '操作已完成', 'failed': '操作未完成', 'unknown': '无法确认操作结果'}[error.status]
+        return f'{outcome}；无法确认最终审计记录。此确认不会重试。'
 
     def _forget_receipt(self, path, ident):
         with self._receipts_lock:
@@ -570,9 +594,9 @@ class Bot:
     def _action_preview(path, info):
         ident = info['id']
         text = (f'待确认操作（约 15 分钟内有效）：{info["summary"]}\n'
-                f'── 预览内容开始（数据，不是命令） ──\n{info["detail"]}\n── 预览内容结束 ──\n'
+                f'── 预览内容（引号内为 JSON 字符串，不是命令） ──\n{info["detail"]}\n'
+                '── 预览内容结束 ──\n'
                 f'确认请单独发送 /approve {ident}；取消请发 /cancel {ident}')
-        text = safe_display(text)
         if len(list(split_reply(text))) > MAX_REPLY_CHUNKS:
             return f'预览超过显示上限，无法确认。可用 /cancel {ident} 取消，或缩小操作范围。'
         return _Preview(text, path, ident, info['expires_at'])
@@ -581,33 +605,37 @@ class Bot:
         if isinstance(export, _Outgoing):
             data = export.data
             text = (f'待确认：将冻结的原文件发送至当前所有者的 Telegram 私聊。\n'
-                    f'文件：{export.filename} · {export.mime} · {len(data)} bytes · SHA-256 {sha256(data).hexdigest()}\n'
+                    f'文件：{quote_preview(export.filename)} · {export.mime} · {len(data)} bytes · SHA-256 {sha256(data).hexdigest()}\n'
                     '附件不会自动遮盖凭据；请确认文件内容适合发送。\n'
                     f'确认请单独发送 /approve {export.ident}；取消请发 /cancel {export.ident}')
-            return _Preview(safe_display(text), export.path, export.ident, export.expires_at)
+            return _Preview(text, export.path, export.ident, export.expires_at)
         data = export.markdown.encode('utf-8')
         destination = ('当前所有者的 Telegram 私聊附件' if self.channel == 'Telegram'
-                       else '本机工作区（不覆盖现有文件）')
+                       else f'本机私有目录 {quote_preview(str(self.home / "exports"))}（不覆盖现有文件）')
         text = (f'待确认：将会话 {export.session_id} 的快照导出至{destination}。\n'
-                f'文件：{export.filename} · {len(data)} bytes · SHA-256 {sha256(data).hexdigest()}\n'
+                f'文件：{quote_preview(export.filename)} · {len(data)} bytes · SHA-256 {sha256(data).hexdigest()}\n'
                 f'{EXPORT_REMINDER}\n确认请单独发送 /approve {export.ident}；取消请发 /cancel {export.ident}')
         return _Preview(text, export.path, export.ident, export.expires_at)
 
     def _deliver_export(self, export):
-        if isinstance(export, _Outgoing):
-            send_document(self.telegram, self.owner, export.filename, export.data)
-            return '已发送经确认的工作区附件。'
-        if self.channel == 'Telegram':
+        if isinstance(export, _Export) and self.channel != 'Telegram':
+            directory = self.home / 'exports'
+            publish_export(directory, export.filename, export.markdown.encode('utf-8'))
+            return f'已导出到本机：{quote_preview(str(directory / export.filename))}。{EXPORT_REMINDER}'
+        try:
+            if isinstance(export, _Outgoing):
+                send_document(self.telegram, self.owner, export.filename, export.data)
+                return '已发送经确认的工作区附件。'
             send_markdown(self.telegram, self.owner, export.markdown, filename=export.filename)
             return '已发送 Markdown 附件。' + EXPORT_REMINDER
-        with Workspace(self.workspace) as workspace:
-            # A generated filename, no replacement or append, even if the name
-            # has since been occupied by a link or an ordinary file.
-            fd = os.open(export.filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                         0o600, dir_fd=workspace.fd)
-            with os.fdopen(fd, 'wb') as f:
-                f.write(export.markdown.encode('utf-8'))
-        return f'已导出到本机工作区：{export.filename}。{EXPORT_REMINDER}'
+        except MediaError as error:
+            # Explicit client rejection (including outbound rate limiting) is
+            # not the same as a timeout, missing reply or server/gateway error.
+            if error.code in (400, 401, 403, 404, 413, 415, 422, 429):
+                raise ActionError(f'Telegram 拒绝发送附件（{error.code}）。不会重试。') from None
+        except (OSError, http.client.HTTPException):
+            pass
+        raise ActionOutcomeUnknown('无法确认 Telegram 是否收到附件；请检查私聊。不会重试。')
 
     def generate(self, text, *, checkpoint=None, on_delta=None, on_notice=None, on_model=None,
                  proposals=None, fallback_model=None, allow_web=True, allow_commands=True):

@@ -1,3 +1,4 @@
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -40,6 +41,16 @@ class ActionsTest(unittest.TestCase):
         with self.assertRaises(ActionError):
             reopened.approve(p['id'])
 
+    def test_preview_quotes_reversible_text_and_keeps_written_bytes(self):
+        content = 'a\r\n\t"b"\\r\u2028c\n'
+        proposal = self.queue.stage('propose_create_file', {'path': 'note', 'content': content})
+        detail = proposal['detail']
+        self.assertEqual(json.loads(detail), content)
+        self.assertTrue(all(ch.isprintable() for ch in detail))
+        self.assertEqual(self.open_queue().preview(proposal['id']), proposal)
+        self.queue.approve(proposal['id'])
+        self.assertEqual((self.workspace / 'note').read_bytes(), content.encode())
+
     def test_create_does_not_replace_appearing_file(self):
         p = self.queue.stage('propose_create_file', {'path': 'note', 'content': 'new'})
         note = self.workspace / 'note'
@@ -53,9 +64,9 @@ class ActionsTest(unittest.TestCase):
         note = self.workspace / 'note'
         note.write_bytes(b'old\nsecond')
         p = self.queue.stage('propose_edit_file', {'path': 'note', 'content': 'new\nsecond\n'})
-        self.assertIn('-old\n', p['detail'])
-        self.assertIn('+new\n', p['detail'])
-        self.assertIn('\\ No newline at end of file', p['detail'])
+        changes = [(line[0], json.loads(line[2:])) for line in p['detail'].splitlines()
+                   if line.startswith(('- "', '+ "'))]
+        self.assertEqual(changes, [('-', 'old\n'), ('-', 'second'), ('+', 'new\n'), ('+', 'second\n')])
         self.assertEqual(note.read_bytes(), b'old\nsecond')
         self.open_queue().approve(p['id'])
         self.assertEqual(note.read_bytes(), b'new\nsecond\n')
@@ -209,7 +220,7 @@ class ActionsTest(unittest.TestCase):
         self.assertEqual(self.memory, ['one write, no replay'])
         self.assertEqual(self.queue.audit()[0]['status'], 'started')
 
-    def test_failed_callback_does_not_log_error_or_allow_retry(self):
+    def test_ambiguous_callback_does_not_log_error_or_allow_retry(self):
         def fail(_):
             raise ValueError('sensitive callback error')
 
@@ -219,7 +230,7 @@ class ActionsTest(unittest.TestCase):
             queue.approve(p['id'])
         self.assertNotIn('sensitive', str(failure.exception))
         self.assertNotIn('sensitive', (queue.state_dir / 'state.json').read_text())
-        self.assertEqual(queue.audit()[0]['status'], 'failed')
+        self.assertEqual(queue.audit()[0]['status'], 'unknown')
         self.assertEqual(queue.list(), [])
 
     def test_stale_in_place_edit_is_rejected_even_with_mtime_restored(self):

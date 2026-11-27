@@ -1,7 +1,9 @@
 """Offline integration tests for Bot's opt-in features."""
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -164,7 +166,7 @@ class BotFeaturesTest(unittest.TestCase):
         self.model.responses = [tool('propose_edit_file', path=path.name, content='after\n')]
         self.bot.handle('编辑文件')
         preview = self.surface.sent[-1][1]
-        self.assertIn('-before\n+after', preview)
+        self.assertIn('- "before\\n"\n+ "after\\n"', preview)
         ident = self.proposal_id(preview)
         path.write_text('changed since preview\n')
         self.send_command('/approve ' + ident)
@@ -208,6 +210,46 @@ class BotFeaturesTest(unittest.TestCase):
         self.bot.local_command('记住：另一条')
         self.assertIn('2. 另一条', self.bot.local_command('查看记忆'))
 
+    def test_memory_file_and_directory_are_synced_before_applied_audit(self):
+        self.model.responses = [tool('propose_memory', text='fixture preference')]
+        self.bot.handle('propose memory')
+        ident = self.proposal_id(self.surface.sent[-1][1])
+        synced = []
+        sync = os.fsync
+
+        def track(fd):
+            path = Path(os.readlink(f'/proc/self/fd/{fd}'))
+            if path.name == '.state.tmp' and self.bot.memory.exists():
+                audit = json.loads(path.read_bytes())['audit']
+                if audit[-1][1]['status'] == 'applied':
+                    self.assertEqual(synced[-1], self.bot.memory.parent)
+                    self.assertTrue(synced[-2].name.startswith('.' + self.bot.memory.name + '.'))
+            synced.append(path)
+            sync(fd)
+
+        with patch('minis.os.fsync', side_effect=track):
+            self.assertIn('已执行', self.send_command('/approve ' + ident))
+        self.assertIn(self.bot.memory.parent, synced)
+        self.assertIn('applied', self.send_command('/audit'))
+
+    def test_memory_sync_failure_is_not_applied_or_retried(self):
+        self.model.responses = [tool('propose_memory', text='fixture preference')]
+        self.bot.handle('propose memory')
+        ident = self.proposal_id(self.surface.sent[-1][1])
+        sync = os.fsync
+
+        def fail_memory_dir(fd):
+            if Path(os.readlink(f'/proc/self/fd/{fd}')) == self.bot.memory.parent:
+                raise OSError('fixture sync failure')
+            sync(fd)
+
+        with patch('minis.os.fsync', side_effect=fail_memory_dir):
+            self.assertNotIn('已执行', self.send_command('/approve ' + ident))
+        self.assertNotIn('applied', self.send_command('/audit'))
+        with patch.object(self.bot, '_remember') as remember:
+            self.send_command('/approve ' + ident)
+            remember.assert_not_called()
+
     def test_skill_import_uses_workspace_file_and_merges_with_bundled(self):
         source = '---\nname: imported\ndescription: Example local skill\n---\nSome steps\n'
         (self.bot.workspace / 'import.md').write_text(source)
@@ -223,6 +265,39 @@ class BotFeaturesTest(unittest.TestCase):
         self.bot.handle('读技能')
         self.assertIn('Some steps', self.model.requests[-1][-1]['content'])
         self.assertNotIn('Some steps', self.model.requests[-1][0]['content'])
+
+    def test_import_and_draft_reject_configured_and_bundled_names(self):
+        configured = self.home / 'configured'
+        bundled = self.home / 'bundled'
+        self.bot.skills_dir = configured
+        document = '---\nname: {name}\ndescription: Fixture\n---\nPlain steps\n'
+        for root in (configured, bundled):
+            name = root.name + '-notes'
+            (root / name).mkdir(parents=True)
+            source = document.format(name=name)
+            (root / name / 'SKILL.md').write_text(source)
+            (self.bot.workspace / 'import.md').write_text(source)
+            with patch('minis_telegram._BUNDLED_SKILLS', bundled):
+                self.assertNotIn('/approve ', self.send_command('/skill import import.md'))
+                self.model.responses = [tool('propose_skill', name=name, description='Fixture', content='Plain text')]
+                self.bot.handle('draft skill')
+                self.assertIn('未建立操作提议', self.surface.sent[-1][1])
+        self.assertFalse(self.bot.skill_overlay.exists())
+
+    def test_skill_approval_rechecks_a_name_added_after_preview(self):
+        self.bot.skills_dir = self.home / 'configured'
+        source = '---\nname: notes\ndescription: Fixture\n---\nPlain steps\n'
+        (self.bot.workspace / 'import.md').write_text(source)
+        ident = self.proposal_id(self.send_command('/skill import import.md'))
+        configured = self.bot.skills_dir / 'notes'
+        configured.mkdir(parents=True)
+        (configured / 'SKILL.md').write_text(source)
+        self.assertNotIn('已执行', self.send_command('/approve ' + ident))
+        self.assertFalse((self.bot.skill_overlay / 'notes').exists())
+        (configured / 'SKILL.md').unlink()
+        configured.rmdir()
+        self.send_command('/approve ' + ident)
+        self.assertFalse((self.bot.skill_overlay / 'notes').exists())
 
     def test_web_uses_current_prompt_only_and_returns_a_separate_footer(self):
         save_history(self.bot.history, [{'role': 'user', 'content': 'https://old.invalid/'}])
@@ -266,19 +341,114 @@ class BotFeaturesTest(unittest.TestCase):
 
     def test_terminal_export_is_confirmed_frozen_redacted_and_non_overwriting(self):
         self.bot = self.make_bot(channel='终端')
-        self.bot.handle('api_key=fixture-secret\n![not an image](https://example.invalid/img)')
-        ident = self.proposal_id(self.send_command('/export'))
+        self.bot.handle('api_key=fixture-secret\n![not an image](https://example.invalid/img)', allow_web=False)
+        preview = self.send_command('/export')
+        ident = self.proposal_id(preview)
+        exports = self.home / 'exports'
+        self.assertIn(str(exports), preview)
+        self.assertFalse(exports.exists())
         self.assertEqual(list(self.bot.workspace.iterdir()), [])
         self.bot.handle('after snapshot')
-        self.send_command('/approve ' + ident)
-        files = list(self.bot.workspace.glob('*.md'))
+        reply = self.send_command('/approve ' + ident)
+        files = list(exports.glob('*.md'))
         self.assertEqual(len(files), 1)
+        self.assertIn(str(files[0]), reply)
+        self.assertEqual(stat.S_IMODE(exports.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
         markdown = files[0].read_text()
         self.assertIn('    ![not an image]', markdown)
         self.assertNotIn('fixture-secret', markdown)
         self.assertNotIn('after snapshot', markdown)
         self.send_command('/approve ' + ident)
-        self.assertEqual(list(self.bot.workspace.iterdir()), files)
+        self.assertEqual(list(exports.iterdir()), files)
+        self.assertEqual(list(self.bot.workspace.iterdir()), [])
+
+    def test_terminal_export_preserves_existing_destination(self):
+        self.bot = self.make_bot(channel='终端')
+        ident = self.proposal_id(self.send_command('/export'))
+        exports = self.home / 'exports'
+        exports.mkdir(mode=0o700)
+        existing = exports / f'minis-session-1-{ident}.md'
+        existing.write_text('keep me')
+        self.assertNotIn('已导出', self.send_command('/approve ' + ident))
+        self.assertEqual(list(exports.iterdir()), [existing])
+        self.assertEqual(existing.read_text(), 'keep me')
+        self.assertIn('failed', self.send_command('/audit'))
+
+    def test_terminal_export_syncs_private_file_and_directory_before_applied(self):
+        self.bot = self.make_bot(channel='终端')
+        ident = self.proposal_id(self.send_command('/export'))
+        exports = self.home / 'exports'
+        final = exports / f'minis-session-1-{ident}.md'
+        synced = []
+        sync = os.fsync
+
+        def track(fd):
+            path = Path(os.readlink(f'/proc/self/fd/{fd}'))
+            if path.parent == exports:
+                self.assertFalse(final.exists())
+                self.assertIn(b'# Minis', path.read_bytes())
+            if path == exports:
+                self.assertTrue(final.is_file())
+                self.assertEqual(synced[-2], self.home)
+                self.assertEqual(synced[-1].parent, exports)
+            if path.name == '.state.tmp' and final.exists():
+                self.assertIn(exports, synced)
+            synced.append(path)
+            sync(fd)
+
+        with patch('minis_actions.os.fsync', side_effect=track):
+            self.assertIn('已导出', self.send_command('/approve ' + ident))
+        self.assertIn(f'applied · {ident}', self.send_command('/audit'))
+
+    def test_terminal_export_directory_sync_failure_is_uncertain_and_not_retried(self):
+        self.bot = self.make_bot(channel='终端')
+        ident = self.proposal_id(self.send_command('/export'))
+        sync = os.fsync
+
+        def fail_export_dir(fd):
+            if Path(os.readlink(f'/proc/self/fd/{fd}')) == self.home / 'exports':
+                raise OSError('fixture sync failure')
+            sync(fd)
+
+        with patch('minis_actions.os.fsync', side_effect=fail_export_dir):
+            self.assertIn('无法确认', self.send_command('/approve ' + ident))
+        self.assertIn(f'unknown · {ident}', self.send_command('/audit'))
+        with patch('minis_telegram.publish_export') as publish:
+            self.send_command('/approve ' + ident)
+            publish.assert_not_called()
+
+    def test_telegram_export_audit_distinguishes_rejection_and_uncertainty(self):
+        for code, status in ((400, 'failed'), (None, 'unknown'), (502, 'unknown')):
+            with self.subTest(code=code):
+                ident = self.proposal_id(self.send_command('/export'))
+                error = MediaError('fixture failure', code=code)
+                with patch('minis_telegram.send_markdown', side_effect=error) as send:
+                    reply = self.send_command('/approve ' + ident)
+                    self.assertIn('拒绝' if status == 'failed' else '无法确认', reply)
+                    self.send_command('/approve ' + ident)
+                    send.assert_called_once()
+                self.assertIn(f'{status} · {ident}', self.send_command('/audit'))
+
+    def test_export_reports_audit_failure_after_effect_and_never_retries(self):
+        ident = self.proposal_id(self.send_command('/export'))
+        queue_type = type(self.bot._queue(self.bot.history))
+        save = queue_type._save
+
+        def fail_final_audit(fd, state):
+            if state['audit'][-1][1]['status'] == 'applied':
+                raise OSError('fixture audit failure')
+            save(fd, state)
+
+        with patch('minis_telegram.send_markdown', return_value={}) as send, patch.object(
+                queue_type, '_save', side_effect=fail_final_audit):
+            reply = self.send_command('/approve ' + ident)
+            self.send_command('/approve ' + ident)
+            send.assert_called_once()
+        self.assertIn('已发送', reply)
+        self.assertIn('审计', reply)
+        self.assertIn(f'started · {ident}', self.send_command('/audit'))
+        self.assertNotIn(f'applied · {ident}', self.send_command('/audit'))
 
     def test_telegram_export_requires_approval_and_is_owner_only_and_one_shot(self):
         self.bot.handle('password=fixture-secret')
