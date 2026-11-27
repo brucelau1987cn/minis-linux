@@ -39,6 +39,7 @@ LOG = logging.getLogger('minis.telegram')
 POLL_TIMEOUT = 25
 MAX_MESSAGE_AGE = 3600
 MAX_REPLY_CHUNKS = 8
+MAX_REPLY_UNITS = 4000
 TELEGRAM_HOST = 'https://api.telegram.org'
 HELP = ('直接发消息聊天，需要时我会查阅已安装的技能。\n'
         '长期记忆：记住：内容 ｜ 查看记忆 ｜ 忘记第 1 条\n'
@@ -79,25 +80,33 @@ class _WebReply(str):
         reply.sources = sources
         return reply
 
-    def telegram_text(self, metadata):
-        # Sources are locally bounded to five public URLs of up to 2,048 chars.
-        # Keep model labels from consuming the space reserved for those links.
-        metadata = next(split_reply(metadata), '')
+    def telegram_parts(self, metadata):
+        # The footer contains at most five checked URL lines. Each fits in
+        # one message; pack whole lines and never split or rejoin these parts.
+        def pack_sources(heading_prefix=''):
+            heading, *lines = self.sources.split('\n')
+            parts = [heading_prefix + heading]
+            for line in lines:
+                together = parts[-1] + '\n' + line
+                if len(together.encode('utf-16-le')) // 2 <= MAX_REPLY_UNITS:
+                    parts[-1] = together
+                else:
+                    parts.append(line)
+            label = next(split_reply(metadata.strip()), '')
+            if label:
+                together = parts[-1] + '\n\n' + label
+                if len(together.encode('utf-16-le')) // 2 <= MAX_REPLY_UNITS:
+                    parts[-1] = together
+                else:
+                    parts.append(label)
+            return parts
 
-        def fits(text):
-            return len(list(islice(split_reply(text), MAX_REPLY_CHUNKS + 1))) <= MAX_REPLY_CHUNKS
-
-        full = str(self) + metadata
-        if fits(full):
-            return full
-        suffix = '\n\n（回复太长，部分正文已省略。）\n\n' + self.sources + metadata
-        room = MAX_REPLY_CHUNKS - len(list(split_reply(suffix)))
-        prefix = list(islice(split_reply(self.answer), max(0, room)))
-        # Joining strings can shift UTF-16 chunk boundaries. Check the joined
-        # result rather than assuming the two independent counts are additive.
-        while prefix and not fits(''.join(prefix) + suffix):
-            prefix.pop()
-        return ''.join(prefix) + suffix
+        footer = pack_sources()
+        body = list(islice(split_reply(self.answer.strip()), MAX_REPLY_CHUNKS + 1))
+        if len(body) + len(footer) > MAX_REPLY_CHUNKS:
+            footer = pack_sources('（回复太长，部分正文已省略。）\n\n')
+            body = body[:MAX_REPLY_CHUNKS - len(footer)]
+        return [*body, *footer]
 
 
 class _TurnHistory(list):
@@ -245,7 +254,7 @@ def split_reply(text):
     start = size = 0
     for i, ch in enumerate(text):
         units = 2 if ord(ch) > 0xFFFF else 1
-        if size + units > 4000:
+        if size + units > MAX_REPLY_UNITS:
             yield text[start:i]
             start, size = i, 0
         size += units
@@ -1055,13 +1064,20 @@ class TaskControl:
         return response['content']
 
     def _send_stream_tail(self, stream, reply):
+        def parts():
+            for i, part in enumerate(split_reply(stream.finish(reply)), start=int(stream.has_preview)):
+                if i >= MAX_REPLY_CHUNKS:
+                    yield '回复太长，后续内容已省略。'
+                    break
+                yield part
+
+        self._send_final_parts(parts())
+
+    def _send_final_parts(self, parts):
         telegram = self.bot.telegram
         deadline = None
         deferrals = 0
-        for i, part in enumerate(split_reply(stream.finish(reply)), start=int(stream.has_preview)):
-            truncated = i >= MAX_REPLY_CHUNKS
-            if truncated:
-                part = '回复太长，后续内容已省略。'
+        for part in parts:
             while not self._shutdown.is_set():
                 try:
                     telegram.send(self.bot.owner, part)
@@ -1082,8 +1098,6 @@ class TaskControl:
                     break
             else:
                 raise TelegramError('sendMessage')
-            if truncated:
-                break
 
     def run(self, task, text, message=None):
         def checkpoint(phase):
@@ -1147,11 +1161,12 @@ class TaskControl:
                     metadata += '\n\n本轮模型：' + safe_display(observed_models[-1])
                 if notices:
                     metadata += '\n\n' + '\n'.join(notices)
-                reply = reply.telegram_text(metadata) if isinstance(reply, _WebReply) else reply + metadata
-                if stream is None:
-                    self.bot.send_reply(reply)
+                if isinstance(reply, _WebReply):
+                    self._send_final_parts(reply.telegram_parts(metadata))
+                elif stream is None:
+                    self.bot.send_reply(reply + metadata)
                 else:
-                    self._send_stream_tail(stream, reply)
+                    self._send_stream_tail(stream, reply + metadata)
                     if stream.delivery_uncertain:
                         outcome = '回复发送状态不明'
                         LOG.warning('Telegram 预览送达状态不明；未重放预览内容')

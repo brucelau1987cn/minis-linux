@@ -174,22 +174,45 @@ class WebTurnTest(unittest.TestCase):
 
     def test_telegram_reserves_space_for_sources_after_oversized_answer(self):
         answer = '🙂' * (2_000 * MAX_REPLY_CHUNKS + 20)
+        urls = [f'https://example.org/{n}/' + 'a' * 1900 for n in range(5)]
+        payloads, status = self._deliver_web(answer, urls)
+        self.assertTrue(any('已省略' in part for part in payloads))
+        self.assertTrue(any('本轮模型：primary' in part for part in payloads))
+        for url in urls:
+            self.assertEqual(sum(url in part for part in payloads), 1, url[:30])
+        self.assertEqual(status, '已完成')
+
+    def test_telegram_short_reply_never_splits_source_at_chunk_boundary(self):
+        url = 'https://example.org/readme'
+        payloads, status = self._deliver_web('🙂' * 1990, [url])
+        self.assertEqual(sum(url in part for part in payloads), 1)
+        self.assertFalse(any('已省略' in part for part in payloads))
+        self.assertEqual(status, '已完成')
+
+    def test_telegram_does_not_replay_or_continue_after_unconfirmed_source_chunk(self):
+        urls = [f'https://example.org/{n}/' + 'a' * 2020 for n in range(3)]
+        payloads, status = self._deliver_web('summary', urls, send_result=[{'message_id': 1}, None])
+        self.assertEqual(len(payloads), 2)
+        self.assertIn(urls[0], payloads[1])
+        self.assertNotIn(urls[1], payloads[1])
+        self.assertEqual(status, '回复发送状态不明')
+
+    def _deliver_web(self, answer, urls, *, send_result=None):
         api = Telegram('123:' + 'x' * 32)
         bot = Bot(self.bot.home, self.bot.owner, 2, api, self.bot.provider, features=True)
         self.open.side_effect = [json_reply(content=answer)]
         tasks = TaskControl(bot)
         self.addCleanup(tasks.close)
-        with (patch('minis_telegram.prepare_web', return_value=self.page()),
-              patch.object(api, 'request', return_value={'message_id': 1}) as request):
+        web = _WebContext('fixture excerpt', list(enumerate(urls, 1)))
+        with (patch('minis_telegram.prepare_web', return_value=web),
+              patch.object(api, 'request', return_value={'message_id': 1}, side_effect=send_result) as request):
             tasks.run(ActiveTask(0), 'Read https://example.org/readme')
         calls = request.call_args_list
         self.assertLessEqual(len(calls), MAX_REPLY_CHUNKS)
         self.assertTrue(all(call.args[0] == 'sendMessage' for call in calls))
-        text = ''.join(call.args[1]['text'] for call in calls)
-        self.assertIn('已省略', text)
-        self.assertIn(self.page().source_footer, text)
-        self.assertIn('本轮模型：primary', text)
-        self.assertEqual(tasks.last, '已完成')
+        payloads = [call.args[1]['text'] for call in calls]
+        self.assertTrue(all(0 < len(part.encode('utf-16-le')) // 2 <= 4000 for part in payloads))
+        return payloads, tasks.last
 
     @staticmethod
     def page():

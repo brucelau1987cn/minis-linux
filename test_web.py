@@ -248,6 +248,14 @@ class WebTest(unittest.TestCase):
         self.dns.assert_not_called()
         self.sock.assert_not_called()
 
+    def test_rejects_a_source_too_long_for_its_utf16_budget_before_dns(self):
+        url = 'https://example.org/' + '😀' * 1020
+        result = prepare_web(f'Read <{url}>')
+        self.assertTrue(result)
+        self.assertFalse(result.source_footer)
+        self.dns.assert_not_called()
+        self.sock.assert_not_called()
+
     def test_rejects_entire_dns_answer_if_any_address_is_not_public(self):
         for blocked in ('10.0.0.1', '::ffff:10.0.0.1', 'fd00::1', '192.0.2.1'):
             with self.subTest(address=blocked):

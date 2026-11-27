@@ -172,7 +172,8 @@ def _global(ip):
 
 def _target(url):
     if (not 0 < len(url) <= _MAX_URL or '\\' in url
-            or any(c.isspace() or not c.isprintable() for c in url)):
+            or any(c.isspace() or not c.isprintable() for c in url)
+            or len(url.encode('utf-16-le')) // 2 > _MAX_URL):
         raise _WebError('网址格式不受支持')
     parts = urlsplit(url)
     tls = parts.scheme == 'https'
