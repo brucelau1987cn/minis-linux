@@ -41,8 +41,8 @@ def safe_display(text):
 
 
 class Workspace:
-    def __init__(self, root):
-        self.fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    def __init__(self, root, *, dir_fd=None):
+        self.fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
 
     def __enter__(self):
         return self
@@ -100,7 +100,7 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class Provider:
-    def __init__(self, base, key, model, *, read_only=False):
+    def __init__(self, base, key, model, *, read_only=False, extra_tools=()):
         u = urlsplit(base)
         if (not u.hostname or u.username is not None or u.password is not None or u.query or u.fragment
                 or (u.scheme != 'https' and not (u.scheme == 'http' and u.hostname in ('127.0.0.1', '::1')))):
@@ -110,6 +110,7 @@ class Provider:
         self.endpoint = base.rstrip('/') + '/chat/completions'
         self.key, self.model = key, model
         self.tools = [t for t in TOOLS if not read_only or t['function']['name'] != 'write_file']
+        self.tools.extend(extra_tools)
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
     def reply(self, messages):
@@ -253,13 +254,22 @@ def normalize_reply(raw):
     return reply
 
 
-def complete_turn(provider, workspace, messages, history_path, *, demo=False, read_only=False):
-    system = SYSTEM + (' 此入口的工具只读，不允许创建文件。' if read_only else '')
+def complete_turn(provider, workspace, messages, history_path, *, demo=False, read_only=False,
+                  context='', skill_view=None):
+    system = SYSTEM + (' 此入口的工具只读，不允许创建文件。' if read_only else '') + context
     for _ in range(MAX_STEPS):
         reply = normalize_reply(provider.reply([{'role': 'system', 'content': system}, *messages]))
         messages.append(reply)
         for call in reply.get('tool_calls', []):
-            if read_only and call['function']['name'] not in ('read_file', 'list_files'):
+            if skill_view is not None and call['function']['name'] == 'skill_view':
+                try:
+                    args = json.loads(call['function']['arguments'])
+                    if not isinstance(args, dict) or args.keys() != {'name'} or not isinstance(args['name'], str):
+                        raise ValueError('参数必须是技能名称')
+                    result = skill_view(args['name'])
+                except (ValueError, RecursionError):
+                    result = '技能未加载：请使用目录中列出的技能名称。'
+            elif read_only and call['function']['name'] not in ('read_file', 'list_files'):
                 result = '未授权：Telegram 工作区只读。'
             else:
                 result = run_tool(workspace, call['function'], demo)

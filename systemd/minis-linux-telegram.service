@@ -4,7 +4,9 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=30s
 DynamicUser=yes
 StateDirectory=minis-linux-telegram
 StateDirectoryMode=0700
@@ -12,7 +14,7 @@ EnvironmentFile=/etc/minis-linux/telegram.conf
 LoadCredential=MINIS_TELEGRAM_BOT_TOKEN:/etc/minis-linux/telegram.token
 LoadCredential=MINIS_API_KEY:/etc/minis-linux/model.key
 WorkingDirectory=/opt/minis-linux
-ExecStart=/usr/bin/python3 -E -s -B /opt/minis-linux/minis_telegram.py --home /var/lib/minis-linux-telegram
+ExecStart=/usr/bin/python3 -E -s -B /opt/minis-linux/minis_telegram.py --home /var/lib/minis-linux-telegram --skills-dir /opt/minis-linux/skills
 Restart=on-failure
 RestartSec=5s
 RestartPreventExitStatus=78

@@ -80,6 +80,82 @@ class TelegramTest(unittest.TestCase):
         self.bot(FakeTelegram([message(21, owner=456)]), other, owner=456).poll_once()
         self.assertEqual(len(other.messages[0]), 2)
 
+    def test_explicit_memory_survives_reset_and_restart_then_can_be_forgotten(self):
+        first = FakeTelegram([message(100, '记住：周报用中文'), message(101, '/new')])
+        self.bot(first, FakeProvider()).poll_once()
+        model = FakeProvider({'content': '收到'}, {'content': '好的'})
+        second = FakeTelegram([message(102, '查看记忆'), message(103, '写周报'),
+                               message(104, '忘记第 1 条'), message(105, '继续')])
+        bot = self.bot(second, model)
+        bot.poll_once()
+        self.assertIn('1. 周报用中文', second.sent[0][1])
+        self.assertIn('周报用中文', model.messages[0][0]['content'])
+        self.assertNotIn('周报用中文', model.messages[1][0]['content'])
+        self.assertNotIn('周报用中文', bot.history.read_text())
+
+    def test_memory_is_writable_only_by_allowed_owner_and_not_by_the_model(self):
+        client = FakeTelegram([message(110, '记住：未授权数据', owner=456), message(111, '你好'),
+                               message(112, '查看记忆')])
+        model = FakeProvider({'tool_calls': [{'id': 'memory', 'type': 'function', 'function': {
+            'name': 'remember', 'arguments': '{"text":"模型想写入"}'}}]}, {'content': '你好'})
+        self.bot(client, model).poll_once()
+        self.assertIn('未授权', model.messages[1][-1]['content'])
+        self.assertIn('没有长期记忆', client.sent[-1][1])
+
+    def test_retrying_a_forget_id_cannot_delete_another_entry(self):
+        first = FakeTelegram([message(113, '记住：甲'), message(114, '记住：乙'),
+                              message(115, '忘记第 1 条')])
+        self.bot(first, FakeProvider()).poll_once()
+        second = FakeTelegram([message(116, '忘记第 1 条'), message(117, '记住：丙'),
+                               message(118, '查看记忆')])
+        self.bot(second, FakeProvider()).poll_once()
+        self.assertIn('找不到', second.sent[0][1])
+        self.assertEqual(second.sent[-1][1], '2. 乙\n3. 丙')
+
+    def test_normal_chat_still_works_if_optional_data_is_unavailable(self):
+        telegram = FakeTelegram([message(119, '继续聊天')])
+        model = FakeProvider({'content': '对话可用'})
+        bot = self.bot(telegram, model)
+        bot.memory.write_text('invalid json', encoding='utf-8')
+        bot.skills_dir.write_text('not a directory', encoding='utf-8')
+        bot.poll_once()
+        self.assertEqual(len(model.messages), 1)
+        self.assertIn('对话可用', telegram.sent[-1][1])
+        self.assertIn('长期记忆', telegram.sent[-1][1])
+        self.assertIn('技能目录', telegram.sent[-1][1])
+
+    def test_skill_can_be_discovered_and_loaded_during_an_ordinary_chat(self):
+        from minis_telegram import Bot
+        root = self.home / 'local-skills'
+        skill = root / 'report'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('---\nname: report\ndescription: 生成周报\n---\n先列事实再列行动项。', encoding='utf-8')
+        telegram = FakeTelegram([message(120, '帮我整理周报')])
+        model = FakeProvider({'tool_calls': [{'id': 'skill', 'type': 'function', 'function': {
+            'name': 'skill_view', 'arguments': '{"name":"report"}'}}]}, {'content': '周报已整理'})
+        bot = Bot(self.home, 123, '1000', telegram, model, skills_dir=root)
+        bot.poll_once()
+        self.assertIn('生成周报', model.messages[0][0]['content'])
+        self.assertNotIn('先列事实再列行动项', model.messages[0][0]['content'])
+        self.assertIn('先列事实再列行动项', model.messages[1][-1]['content'])
+        self.assertEqual(telegram.sent[-1][1], '周报已整理')
+
+    def test_skill_catalog_never_loads_symlinks_or_traversal(self):
+        from minis_skills import SkillCatalog
+        root = self.home / 'local-skills'
+        root.mkdir()
+        outside = self.home / 'outside'
+        outside.mkdir()
+        (outside / 'SKILL.md').write_text('---\ndescription: Private\n---\nDo not load this file.', encoding='utf-8')
+        (root / 'symlink-dir').symlink_to(outside, target_is_directory=True)
+        (root / 'symlink-file').mkdir()
+        (root / 'symlink-file/SKILL.md').symlink_to(outside / 'SKILL.md')
+        catalog = SkillCatalog(root)
+        self.assertEqual(catalog.entries, {})
+        for name in ('../outside', 'symlink-dir', 'symlink-file'):
+            with self.assertRaises(ValueError):
+                catalog.view(name)
+
     def test_malformed_model_unicode_cannot_poison_following_turn(self):
         telegram = FakeTelegram([message(22), message(23)])
 
@@ -165,8 +241,7 @@ class TelegramTest(unittest.TestCase):
         self.assertEqual(model.messages[1][-1]['content'], '授权样本文本')
 
     def test_bot_api_http_round_trip_with_model_http(self):
-        from minis import Provider
-        from minis_telegram import Bot, Telegram
+        from minis_telegram import Bot, config
         requests = []
         fixture_token = '1000:' + 'X' * 32
 
@@ -177,7 +252,12 @@ class TelegramTest(unittest.TestCase):
                 if self.path.endswith('/getUpdates'):
                     result = {'ok': True, 'result': [message(3, '请回复测试')]}
                 elif self.path == '/v1/chat/completions':
-                    result = {'choices': [{'message': {'content': '本地 HTTP 联调成功'}}]}
+                    if body['messages'][-1]['role'] == 'tool':
+                        msg = {'content': '本地 HTTP 联调成功'}
+                    else:
+                        msg = {'tool_calls': [{'id': 'use-report', 'type': 'function', 'function': {
+                            'name': 'skill_view', 'arguments': '{"name":"report"}'}}]}
+                    result = {'choices': [{'message': msg}]}
                 elif self.path.endswith('/sendMessage'):
                     result = {'ok': True, 'result': {}}
                 else:
@@ -195,21 +275,27 @@ class TelegramTest(unittest.TestCase):
             thread.start()
             try:
                 base = f'http://127.0.0.1:{server.server_port}'
-                with patch('minis_telegram.TELEGRAM_HOST', base):
-                    telegram = Telegram(fixture_token)
-                model = Provider(base + '/v1', 'model-fixture', 'model', read_only=True)
-                Bot(self.home, 123, telegram.bot_id, telegram, model).poll_once()
+                skill = self.home / 'skills' / 'report'
+                skill.mkdir(parents=True)
+                (skill / 'SKILL.md').write_text('---\ndescription: Report\n---\nUse short headings.', encoding='utf-8')
+                with patch('minis_telegram.TELEGRAM_HOST', base), patch.dict('os.environ', {
+                    'MINIS_TELEGRAM_USER_ID': '123', 'MINIS_TELEGRAM_BOT_TOKEN': fixture_token,
+                    'MINIS_API_KEY': 'model-fixture', 'MINIS_BASE_URL': base + '/v1', 'MINIS_MODEL': 'model',
+                }, clear=True):
+                    owner, telegram, model = config()
+                Bot(self.home, owner, telegram.bot_id, telegram, model).poll_once()
             finally:
                 server.shutdown()
                 thread.join()
 
         self.assertEqual([path for path, _ in requests], [f'/bot{fixture_token}/getUpdates',
-                         '/v1/chat/completions', f'/bot{fixture_token}/sendMessage'])
+                         '/v1/chat/completions', '/v1/chat/completions', f'/bot{fixture_token}/sendMessage'])
         self.assertEqual(requests[0][1]['allowed_updates'], ['message'])
         self.assertEqual(requests[1][1]['messages'][-1]['content'], '请回复测试')
-        self.assertEqual([t['function']['name'] for t in requests[1][1]['tools']], ['list_files', 'read_file'])
-        self.assertEqual(requests[2][1]['chat_id'], 123)
-        self.assertEqual(requests[2][1]['text'], '本地 HTTP 联调成功')
+        self.assertEqual([t['function']['name'] for t in requests[1][1]['tools']], ['list_files', 'read_file', 'skill_view'])
+        self.assertEqual(requests[2][1]['messages'][-1]['content'], 'Use short headings.')
+        self.assertEqual(requests[3][1]['chat_id'], 123)
+        self.assertEqual(requests[3][1]['text'], '本地 HTTP 联调成功')
 
 
 if __name__ == '__main__':
