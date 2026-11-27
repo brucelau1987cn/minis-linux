@@ -7,5 +7,11 @@ __pycache__/
 
 # Local example data and custom in-repository state directories
 /demo-state/
+/telegram-state/
+/telegram/
+/telegram.lock
+telegram.token
+model.key
+telegram.conf
 /sessions/
 /workspace/
