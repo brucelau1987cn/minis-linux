@@ -41,8 +41,11 @@ sudo /usr/bin/python3 -EsB install.py
 
 ## 常用命令
 
+只想用终端、不装 Telegram 时，在可信安装包解压目录执行 `/usr/bin/python3 -EsB install.py --user`，不要加 `sudo`。程序和终端状态放在 `~/.minis/`，启动命令放在 `~/.local/bin/minis`；将 `~/.local/bin` 加入 `PATH` 后，可在任意目录运行 `minis`。安装前先退出旧的 Minis 对话；已有终端配置和会话会迁移到 `~/.minis/terminal/`，不会同步给 Telegram。用户版升级时，从可信新版安装包重跑 `install.py --user`；下表中的 `minis update` 安装操作仅适用于系统版。
+
 ```bash
-minis                 # 打开终端对话
+minis                 # 打开带启动面板和状态行的终端对话
+minis --plain         # 只显示普通命令行提示
 minis model           # 选择或添加网关，再设置终端默认模型（v0.3 起）
 minis model --show    # 查看已保存的终端默认模型
 minis --version       # 查看已安装版本

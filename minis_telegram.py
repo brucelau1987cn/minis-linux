@@ -17,7 +17,7 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from minis import (NoRedirect, Provider, Workspace, clean_history_temps, complete_turn,
-                   read_history, save_history, valid_unicode)
+                   current_time, read_history, save_history, valid_unicode, workspace_disk)
 from minis_skills import SKILL_TOOL, SkillCatalog
 
 LOG = logging.getLogger('minis.telegram')
@@ -27,7 +27,8 @@ MAX_REPLY_CHUNKS = 8
 TELEGRAM_HOST = 'https://api.telegram.org'
 HELP = ('直接发消息聊天，需要时我会查阅已安装的技能。\n'
         '长期记忆：记住：内容 ｜ 查看记忆 ｜ 忘记第 1 条\n'
-        '/skills 查看技能，/status 查在线，/new 清空本机聊天上下文（保留长期记忆）。')
+        '/skills 查看技能，/status 查在线，/new 清空本机聊天上下文（保留长期记忆）。\n'
+        '/time 查服务器时间，/disk 查工作区磁盘余量。')
 TASK_HELP = '\n/status 查看任务进度，/stop 停止当前任务；一次只运行一个任务。'
 MAX_MEMORIES = 32
 MAX_MEMORY_CHARS = 240
@@ -257,6 +258,14 @@ class Bot:
             reply = HELP
         elif text == '/status':
             reply = f'Minis Linux 在线。{self.channel}工作区只读。'
+        elif text == '/time':
+            reply = current_time()
+        elif text == '/disk':
+            try:
+                with Workspace(self.workspace) as workspace:
+                    reply = workspace_disk(workspace)
+            except OSError:
+                reply = '暂时无法读取工作区所在文件系统。'
         elif text == '/new':
             clean_history_temps(self.history)
             save_history(self.history, [])
@@ -268,7 +277,7 @@ class Bot:
             except OSError:
                 reply = '技能目录暂时无法读取。'
         elif text.startswith('/'):
-            reply = '未知命令。可用：/help、/status、/skills、/new。'
+            reply = '未知命令。发送 /help 查看可用命令。'
         else:
             return None
         return reply

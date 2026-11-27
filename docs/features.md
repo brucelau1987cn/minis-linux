@@ -20,9 +20,11 @@ Bot 接到任务后先发回执。模型请求在后台执行，等待时仍可�
 
 ### 交互式终端
 
-安装后运行 `minis` 打开行式对话界面。首次启动可填写模型配置，也可预先提供 `MINIS_BASE_URL`、`MINIS_MODEL` 和 `MINIS_API_KEY`。终端与 Telegram 分别保存设置、工作区、会话和记忆，不会自动同步。发送 `/exit` 退出终端。
+安装后运行 `minis` 打开终端对话。启动面板显示当前模型、网关主机名、可用工具和技能；输入区旁的状态行显示当前模型和上一轮耗时。界面保留 SSH 终端滚屏，窄窗口或 `minis --plain` 使用简洁提示。首次启动可填写模型配置，也可预先提供 `MINIS_BASE_URL`、`MINIS_MODEL` 和 `MINIS_API_KEY`。终端与 Telegram 分别保存设置、工作区、会话和记忆，不会自动同步。发送 `/exit` 退出终端。
 
 如果只想试界面，在解压目录中运行 `python3 minis_cli.py --demo`。该演示使用固定的本地响应，不调用模型，也不修改正式会话。
+
+只使用终端时，可运行 `/usr/bin/python3 -EsB install.py --user`，不需要 `sudo` 或 Telegram 凭据。程序在 `~/.minis/app/`，终端状态在 `~/.minis/terminal/`。如果 `~/.local/bin` 不在 `PATH`，可先运行 `export PATH="$HOME/.local/bin:$PATH"`，或直接执行 `~/.local/bin/minis`。Telegram 仍按[常驻部署手册](../systemd/README.md)单独安装和配置。
 
 ### 设置终端默认模型（v0.3 起）
 
@@ -43,6 +45,14 @@ Bot 接到任务后先发回执。模型请求在后台执行，等待时仍可�
 > 使用 `weekly-report` 技能读取 `handover.md`，按已完成、风险和下一步整理中文周报。缺少的信息标记为待确认。
 
 仓库提供一个 [周报技能示例](../skills/weekly-report/SKILL.md)。默认 systemd 部署从 `/opt/minis-linux/skills/<名称>/SKILL.md` 加载技能。技能文本可以指导模型使用已有工具，但不会授予新权限；Minis 不执行技能附带的脚本。
+
+### 网页搜索（终端）
+
+在终端对话中输入 `/search Debian 安全公告`，Minis 通过 [DuckDuckGo Lite](https://lite.duckduckgo.com/lite/) 返回最多 5 条标题、链接和搜索摘要。无需搜索 API Key，也不调用模型，不自动打开结果网页。只有输入的关键词会发送给 DuckDuckGo；不要搜索密钥或内部资料。Lite 不是有可用性承诺的搜索 API，遇到限流、验证页或页面格式变化时会提示，不绕过验证。离线演示和 Telegram 不提供此命令。
+
+### 本机时间和磁盘余量
+
+终端和 Telegram 都可以用普通消息询问日期、星期、时间或工作区磁盘余量。Minis 从运行主机读取时间，并报告主机时区与 UTC 偏移，不假设它与你所在地相同。模型每轮获得一份服务器时间快照，需要时可重新查询。`/time` 和 `/disk` 直接查询，不调用模型；磁盘仅报告工作区所在文件系统的容量，不接受其他路径。
 
 ### 只读工作区
 

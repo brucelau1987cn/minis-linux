@@ -74,6 +74,18 @@ class TelegramTest(unittest.TestCase):
         self.assertEqual([x['content'] for x in model.messages[0][1:]], ['第一轮', '答一', '第二轮'])
         self.assertEqual([x['content'] for x in model.messages[1][1:]], ['第三轮'])
 
+    def test_time_and_disk_commands_only_answer_the_owner_without_a_model(self):
+        client = FakeTelegram([message(1, '/time', owner=456), message(2, '/disk', kind='group'),
+                               message(3, '/time'), message(4, '/disk')])
+        model = FakeProvider()
+        bot = self.bot(client, model)
+        bot.poll_once()
+        self.assertEqual(model.messages, [])
+        self.assertEqual(len(client.sent), 2)
+        self.assertIn('本机时间：', client.sent[0][1])
+        self.assertIn('工作区所在文件系统：可用', client.sent[1][1])
+        self.assertFalse(bot.history.exists())
+
     def test_owner_change_does_not_inherit_conversation(self):
         self.bot(FakeTelegram([message(20, '私密历史')]), FakeProvider({'content': '私密回答'})).poll_once()
         other = FakeProvider({'content': '答'})
@@ -292,7 +304,8 @@ class TelegramTest(unittest.TestCase):
                          '/v1/chat/completions', '/v1/chat/completions', f'/bot{fixture_token}/sendMessage'])
         self.assertEqual(requests[0][1]['allowed_updates'], ['message'])
         self.assertEqual(requests[1][1]['messages'][-1]['content'], '请回复测试')
-        self.assertEqual([t['function']['name'] for t in requests[1][1]['tools']], ['list_files', 'read_file', 'skill_view'])
+        self.assertEqual([t['function']['name'] for t in requests[1][1]['tools']],
+                         ['list_files', 'read_file', 'get_current_time', 'get_workspace_disk', 'skill_view'])
         self.assertEqual(requests[2][1]['messages'][-1]['content'], 'Use short headings.')
         self.assertEqual(requests[3][1]['chat_id'], 123)
         self.assertEqual(requests[3][1]['text'], '本地 HTTP 联调成功')

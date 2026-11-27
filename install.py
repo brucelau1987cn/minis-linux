@@ -3,23 +3,26 @@
 import argparse
 import base64
 import fcntl
-import getpass
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
+from shlex import quote as shell_quote
 import stat
 import subprocess
 import sys
 import tempfile
+import termios
 
 from minis import Provider
-from minis_cli import installed_version, version_tuple
+from minis_cli import ask_secret, installed_version, select_model, terminal_config, terminal_lock, version_tuple
 from minis_telegram import Telegram
 
 UNIT = 'minis-linux-telegram.service'
-APP_FILES = ('minis.py', 'minis_skills.py', 'minis_telegram.py', 'minis_cli.py', 'VERSION')
+APP_FILES = ('minis.py', 'minis_skills.py', 'minis_telegram.py', 'minis_search.py', 'minis_cli.py', 'VERSION')
 LAUNCHER = b'#!/bin/sh\n# Minis Linux managed launcher\nexec /usr/bin/python3 -EsB /opt/minis-linux/minis_cli.py "$@"\n'
+USER_LAUNCHER = b'#!/bin/sh\n# Minis Linux user launcher\n'
 SAMPLE = 'skills/weekly-report/SKILL.md'
 CONFIG_FILES = ('telegram.conf', 'telegram.token', 'model.key')
 PENDING = 'opt/minis-linux/.pending-upgrade.json'
@@ -41,18 +44,24 @@ def ask_config(credentials_dir=None):
         raise ValueError('首次安装需要交互终端。')
     print('首次安装：请准备专用 Telegram Bot；不要复用已有 Bot 的 Token。')
     owner = input('Telegram 数字用户 ID: ').strip()
+    if not re.fullmatch(r'[1-9][0-9]{0,15}', owner):
+        raise ValueError('Telegram 用户 ID 应为数字。')
     base = input('模型 Base URL（含 /v1）: ').strip()
-    model = input('模型 ID: ').strip()
+    if not base:
+        raise ValueError('已取消安装，未配置模型网关。')
+    token = None
     if credentials_dir is not None:
         checked_directory(credentials_dir, private=True, accept_invoker=True)
-        return owner, base, model, *(read_input_credential(credentials_dir / name) for name in CONFIG_FILES[1:])
-    print('如 sudo/堡垒机录制终端输入，请取消并使用 --credentials-dir，避免记录密钥。')
-    # Fail closed rather than accepting a fallback that echoes secrets.
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter('error', getpass.GetPassWarning)
-        token = getpass.getpass('Telegram Bot Token（不回显）: ')
-        key = getpass.getpass('模型 API Key（不回显）: ')
+        token, key = (read_input_credential(credentials_dir / name) for name in CONFIG_FILES[1:])
+        Telegram(token)
+    else:
+        print('如 sudo/堡垒机录制终端输入，请取消并使用 --credentials-dir，避免记录密钥。')
+        key = ask_secret('模型 API Key: ')
+    model = select_model(base, key, None)
+    if model is None:
+        raise ValueError('已取消选模，未安装。')
+    if token is None:
+        token = ask_secret('Telegram Bot Token: ')
     return owner, base, model, token, key
 
 
@@ -351,22 +360,95 @@ def install(source, root, *, ask, run, upgrade_to=None):
     activate(payloads, run=run, root=root)
 
 
+def install_user(source, home):
+    """Install a per-user terminal app without enabling any system service."""
+    names = (*APP_FILES, SAMPLE)
+    payloads = {}
+    digest = sha256()
+    for name in names:
+        path = source / name
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f'安装包缺少普通文件：{name}')
+        content = path.read_bytes()
+        payloads[name] = content
+        digest.update(name.encode() + b'\0' + sha256(content).digest())
+    version = installed_version(source)
+
+    base, bindir = home / '.minis', home / '.local/bin'
+    launcher = bindir / 'minis'
+    os.umask(0o077)
+    checked_directory(home)
+    mkdir_checked(bindir.parent)
+    mkdir_checked(bindir)
+    existing = snapshot_file(launcher)
+    if existing is not None and not existing[0].startswith(USER_LAUNCHER):
+        raise ValueError('~/.local/bin/minis 已被其他程序使用；未覆盖。')
+
+    with terminal_lock(base):
+        apps, state = base / 'app', base / 'terminal'
+        mkdir_checked(apps, 0o700)
+        bundle = apps / f'{version}-{digest.hexdigest()}'
+        if bundle.exists() or bundle.is_symlink():
+            for folder in (bundle, bundle / 'skills', (bundle / SAMPLE).parent):
+                checked_directory(folder, private=True)
+            for name, content in payloads.items():
+                prior = snapshot_file(bundle / name)
+                if prior is None or prior[0] != content:
+                    raise ValueError('已安装程序文件与安装包不一致；未覆盖启动命令。')
+        else:
+            with tempfile.TemporaryDirectory(prefix='.staging-', dir=apps) as scratch:
+                staged = Path(scratch) / 'bundle'
+                staged.mkdir(mode=0o700)
+                (staged / SAMPLE).parent.mkdir(mode=0o700, parents=True)
+                for name, content in payloads.items():
+                    atomic_write(staged / name, content, 0o600)
+                staged.rename(bundle)
+                sync_directory(apps)
+        legacy = home / '.local/share/minis-linux-terminal'
+        if legacy.exists() or legacy.is_symlink():
+            checked_directory(legacy.parent)
+            checked_directory(legacy, private=True)
+            if state.exists() or state.is_symlink():
+                raise ValueError('新旧终端状态目录同时存在；为避免覆盖，安装已停止。')
+            with terminal_lock(legacy):
+                terminal_config(legacy)
+                legacy.rename(state)
+        else:
+            mkdir_checked(state, 0o700)
+        entry = shell_quote(str(bundle / 'minis_cli.py'))
+        atomic_write(launcher, USER_LAUNCHER + f'exec /usr/bin/python3 -EsB {entry} "$@"\n'.encode(), 0o755)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='check package and systemd unit without installing')
     parser.add_argument('--recover', action='store_true', help='restore a pending interrupted installation without installing a new version')
     parser.add_argument('--credentials-dir', type=Path, help='read telegram.token and model.key from private files instead of prompting for secrets')
     parser.add_argument('--upgrade-to', help=argparse.SUPPRESS)
+    parser.add_argument('--user', action='store_true', help='install only terminal chat into the current user home')
     args = parser.parse_args()
     if sys.platform != 'linux' or sys.version_info < (3, 10):
         parser.error('需要 Linux 和 Python 3.10+。')
-    os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
     source = Path(__file__).resolve().parent
 
     def run(command, *, probe=False):
         return subprocess.run(command, check=not probe).returncode == 0
 
     try:
+        if args.user:
+            if args.check or args.recover or args.credentials_dir is not None or args.upgrade_to is not None:
+                parser.error('--user 不能与系统安装选项合用')
+            if os.geteuid() == 0 and os.environ.get('SUDO_UID', '') not in ('', '0'):
+                raise ValueError('请直接用目标 Linux 用户运行 --user，不要加 sudo。')
+            home = Path.home()
+            install_user(source, home)
+            print('终端已安装到 ~/.minis；未配置 Telegram。')
+            if str(home / '.local/bin') in os.get_exec_path():
+                print('在任意目录输入 minis 开始对话。')
+            else:
+                print('请将 ~/.local/bin 加入 PATH，或运行 ~/.local/bin/minis。')
+            return 0
+        os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
         if args.check:
             preflight(source, run=run)
             print('安装包和 systemd 服务文件检查通过；未安装或连接外部服务。')
@@ -389,9 +471,10 @@ def main():
                     upgrade_to=args.upgrade_to)
         print('Minis 已安装并设置开机启动。请在专用 Bot 私聊发 /status，再发一句话验证模型。')
         return 0
-    except (OSError, ValueError, EOFError, getpass.GetPassWarning, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, EOFError, termios.error, subprocess.CalledProcessError) as exc:
         print(f'安装未完成：{exc}', file=sys.stderr)
-        print('若服务启动失败，请检查 sudo journalctl -u minis-linux-telegram.service -n 30。', file=sys.stderr)
+        if not args.user:
+            print('若服务启动失败，请检查 sudo journalctl -u minis-linux-telegram.service -n 30。', file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print('\n安装已取消。', file=sys.stderr)

@@ -1,13 +1,65 @@
+from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import io
+import json
 from pathlib import Path
 import os
 import socket
 import subprocess
 import tempfile
+from threading import Thread
 import unittest
 from unittest.mock import Mock, patch
 
 
 class InstallTest(unittest.TestCase):
+    def test_user_only_install_reuses_legacy_config_and_runs_from_other_directory(self):
+        from install import install_user
+        legacy = self.root / '.local/share/minis-linux-terminal'
+        legacy.mkdir(parents=True, mode=0o700)
+        config = legacy / 'terminal-config.json'
+        config.write_text('["https://example.invalid/v1", "saved-model", "fixture-key"]')
+        config.chmod(0o600)
+        initial = config.read_bytes()
+        session = legacy / 'telegram/bot-terminal-owner-1.json'
+        session.parent.mkdir(mode=0o700)
+        session.write_text('[{"role":"user","content":"saved conversation"}]')
+        initial_session = session.read_bytes()
+        install_user(self.source, self.root)
+        install_user(self.source, self.root)
+        state = self.root / '.minis/terminal/terminal-config.json'
+        self.assertEqual(state.read_bytes(), initial)
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((state.parent / session.relative_to(legacy)).read_bytes(), initial_session)
+        self.assertFalse(legacy.exists())
+        launcher = self.root / '.local/bin/minis'
+        run = subprocess.run([str(launcher), 'model', '--show'], cwd='/',
+                             env={**os.environ, 'HOME': str(self.root)}, text=True,
+                             capture_output=True, check=True)
+        self.assertIn('saved-model', run.stdout)
+        self.assertNotIn('fixture-key', run.stdout)
+        self.assertFalse((self.root / '.hermes').exists())
+
+    def test_user_only_install_does_not_overwrite_foreign_launcher(self):
+        from install import install_user
+        launcher = self.root / '.local/bin/minis'
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text('unrelated')
+        with self.assertRaises(ValueError):
+            install_user(self.source, self.root)
+        self.assertEqual(launcher.read_text(), 'unrelated')
+        self.assertFalse((self.root / '.minis').exists())
+
+    def test_user_install_does_not_move_state_while_chat_is_running(self):
+        from install import install_user
+        from minis_cli import terminal_lock
+        legacy = self.root / '.local/share/minis-linux-terminal'
+        with terminal_lock(legacy), self.assertRaisesRegex(ValueError, '已有 Minis 终端会话'):
+            install_user(self.source, self.root)
+        self.assertTrue(legacy.is_dir())
+        self.assertFalse((self.root / '.minis/terminal').exists())
+        self.assertFalse((self.root / '.local/bin/minis').exists())
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -199,10 +251,58 @@ class InstallTest(unittest.TestCase):
             path.chmod(0o600)
         with patch('sys.stdin.isatty', return_value=True), \
                 patch('builtins.input', side_effect=['123', 'https://api.example.com/v1', 'test/model']), \
-                patch('getpass.getpass') as secret_prompt:
+                patch('minis_cli.model_catalog', return_value=[]), \
+                patch('install.ask_secret') as secret_prompt:
             values = ask_config(self.root)
             secret_prompt.assert_not_called()
         self.assertEqual(values[3:], ('123:' + 'X' * 32, 'fixture-key'))
+
+    def test_first_install_picks_model_from_gateway_with_supplied_key(self):
+        from install import ask_config, config_bytes
+        requests = []
+
+        class Catalog(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get('Authorization')))
+                body = json.dumps({'data': [{'id': 'sample/a'}, {'id': 'sample/b'}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        token = '123:' + 'X' * 32
+        with HTTPServer(('127.0.0.1', 0), Catalog) as server:
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f'http://127.0.0.1:{server.server_port}/v1'
+                with patch('sys.stdin.isatty', return_value=True), redirect_stdout(io.StringIO()) as output, \
+                        patch('builtins.input', side_effect=['123', base, '2']), \
+                        patch('install.ask_secret', side_effect=['fixture-key', token]):
+                    config, _, _ = config_bytes(ask_config())
+            finally:
+                server.shutdown()
+                thread.join(2)
+        self.assertEqual(requests, [('/v1/models', 'Bearer fixture-key')])
+        self.assertIn(b'MINIS_MODEL="sample/b"', config)
+        self.assertNotIn('fixture-key', output.getvalue())
+        self.assertNotIn(token, output.getvalue())
+
+    def test_cancelling_model_selection_does_not_write_install_files(self):
+        from install import ask_config, install
+        run = Mock()
+        with patch('sys.stdin.isatty', return_value=True), redirect_stdout(io.StringIO()), \
+                patch('builtins.input', side_effect=['123', 'https://api.example.com/v1', '']), \
+                patch('install.ask_secret', return_value='fixture-key'), \
+                patch('minis_cli.model_catalog', return_value=['sample/a']):
+            with self.assertRaisesRegex(ValueError, '取消'):
+                install(self.source, self.root, ask=ask_config, run=run)
+        self.assertFalse((self.root / 'etc/minis-linux').exists())
+        self.assertFalse((self.root / 'opt').exists())
+        run.assert_not_called()
 
     def test_partial_config_refused_without_overwriting(self):
         from install import install

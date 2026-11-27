@@ -8,7 +8,7 @@
 git clone https://github.com/brucelau1987cn/minis-linux.git && cd minis-linux && sudo /usr/bin/python3 -EsB install.py
 ```
 
-需要 Python 3.10+（`/usr/bin/python3`）、Git、sudo 和连接到服务器的交互终端。只从信任的仓库或版本执行安装器。向导会询问 Telegram 数字用户 ID、模型地址和模型 ID，密钥输入不回显。已有完整配置时不问密钥，更新代码后重启并设置开机启动。现有配置不完整时停止，不覆盖。安装器不替你安装系统依赖、不创建 Telegram Bot、不开放防火墙，也不会自动更新代码。用 `python3 install.py --check` 可只校验安装包和 unit，不安装、不联网。
+需要 Python 3.10+（`/usr/bin/python3`）、Git、sudo 和连接到服务器的交互终端。只从信任的仓库或版本执行安装器。首次安装时，输入 Telegram 数字用户 ID、模型 Base URL 和普通调用 API Key，选择网关通过 `/models` 返回的模型，再填写专用 Bot Token。输入密钥时只显示 `*`，不会显示原文。选模不调用推理；网关目录不可用时可手填模型 ID，取消选模不会写入安装配置。已有完整配置时不重新选模、不问密钥，更新代码后重启并设置开机启动。现有配置不完整时停止，不覆盖。安装器不替你安装系统依赖、不创建 Telegram Bot、不开放防火墙，也不会自动更新代码。用 `python3 install.py --check` 可只校验安装包和 unit，不安装、不联网。
 
 **终端有录制时，不要在终端输入密钥。** `sudo`/堡垒机的输入日志可记录不回显的内容。通过受信任的安全文件传输或密钥管理流程，将 `telegram.token` 与 `model.key` 预先放在仓库外本人持有的私有目录中（目录 `0700`，文件 `0600`，每个文件一行）。然后执行 `sudo /usr/bin/python3 -EsB install.py --credentials-dir "$HOME/.config/minis-install-input"`，向导只问非密钥配置，安装器从文件读取密钥。按本机凭据管理约定处理输入文件，不要提交进 Git。
 
@@ -62,7 +62,7 @@ sudo journalctl -u minis-linux-telegram.service -n 30 --no-pager
 ## 3. 状态、权限与停止
 
 - `StateDirectory=` 持久化在 `/var/lib/minis-linux-telegram`；使用 `DynamicUser=` 时 systemd 可能把实际目录放在 `/var/lib/private/` 下。会话和轮询游标不与命令行会话共用。日志不打印密钥、消息或模型响应正文。
-- Telegram 只能读该目录下 `workspace/` 顶层的普通文本文件，不提供 Shell 或写文件工具。需要处理文件时，只放专用、不含敏感信息的副本；工具结果可能发给模型，也可能进入 Telegram 回复。工作区限制不是通用沙箱；systemd 只允许服务修改自己的状态目录等必要位置。
+- Telegram 提供 `/time` 和 `/disk` 查询服务器时间和工作区所在文件系统的容量，不调用模型。文件读取仍限于该目录下 `workspace/` 顶层的普通文本文件，不提供 Shell 或写文件工具。需要处理文件时，只放专用、不含敏感信息的副本；工具结果可能发给模型，也可能进入 Telegram 回复。工作区限制不是通用沙箱；systemd 只允许服务修改自己的状态目录等必要位置。
 - Telegram 收消息与模型请求分开处理。一次只执行一个模型任务；忙时收到的新普通消息会明确提示**未排队**，不自动重试。`/status` 查询阶段和上次任务结果，`/stop` 停止尚未提交的任务。已停止的任务不会再保存为会话或发送结果；旧请求可能仍在模型网关执行，退出前占用唯一任务位。已经提交、正在发送的回复不能撤回。进行中要清空会话，请先 `/stop` 再 `/new`。
 - 已完成的会话重启后仍保留，进行中的任务不会自动重跑。超过一小时的缓存消息忽略；处理前先记住消息序号，进程中途退出或回复发送失败时，该条可能没有回复。Telegram **收消息**失败会退避重连；**发送回复**被限流时，仍处理收到的 `/stop`，只是确认消息可能发不出去。限流结束后可用 `/status` 确认结果。无效 token 或轮询冲突时服务停止，先修配置再启动。
 - 停用（保留配置和状态）：`sudo systemctl disable --now minis-linux-telegram.service`。修改配置、密钥或应用后用 `sudo systemctl restart minis-linux-telegram.service` 生效。
