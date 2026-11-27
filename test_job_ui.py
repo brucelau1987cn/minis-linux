@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 from minis import Provider
 from minis_job_ui import JobUI
-from minis_telegram import Bot
+from minis_schedule import Scheduler
+from minis_telegram import Bot, TaskControl
 
 
 class TelegramFixture:
@@ -123,6 +124,34 @@ class JobUITests(unittest.TestCase):
         self.assertIn(reminder, '\n'.join(logs.output))
         self.assertNotIn('喝水', '\n'.join(logs.output))
         self.assertNotIn('private prompt', '\n'.join(logs.output))
+
+    def test_blocked_reminder_delivery_does_not_reserve_model_slot(self):
+        tasks = TaskControl(self.bot)
+        ui = self.ui_for(prompt_slot=tasks.prompt_slot)
+        reminder = self.create(ui, '1分钟后提醒我喝水')
+        soon = datetime.now(timezone.utc) + timedelta(minutes=2)
+        sending, release = threading.Event(), threading.Event()
+        attempts = []
+
+        def send(reply):
+            attempts.append(reply)
+            sending.set()
+            release.wait(3)
+
+        with patch.object(self.bot, 'send_reply', side_effect=send):
+            worker = ui.start(interval=0.01, clock=lambda: soon)
+            try:
+                self.assertTrue(sending.wait(2))
+                with tasks.prompt_slot() as acquired:
+                    self.assertTrue(acquired, 'reminder delivery occupied the model slot')
+                ui.close()
+                with Scheduler(ui.scheduler.path) as reopened:
+                    self.assertEqual(reopened.list()[0].last_outcome, 'interrupted')
+                    self.assertIsNone(reopened.tick(deliver=lambda *_: self.fail('replayed'), now=soon))
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertEqual(attempts, [f'提醒（{reminder}）：\n喝水'])
 
     def test_mutations_require_unexpired_nonce_bound_to_exact_job_and_action(self):
         ui = self.ui_for()
@@ -296,6 +325,22 @@ class JobUITests(unittest.TestCase):
         self.assertIn('outcome=delivery_failed', joined)
         self.assertNotIn('token and raw payload', joined)
         self.assertNotIn('confidential', joined)
+
+    def test_tick_failure_disables_schedule_preview_and_pending_confirmation(self):
+        tasks = TaskControl(self.bot)
+        ui = tasks.jobs = self.ui_for(prompt_slot=tasks.prompt_slot)
+        pending = self.confirmation(ui.command('/schedule in 10 minutes remind me: pending'))
+        with patch.object(ui.scheduler, 'tick', side_effect=OSError('private DB details')), \
+                self.assertLogs('minis_job_ui', level='ERROR') as logs:
+            worker = ui.start()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn('private DB details', '\n'.join(logs.output))
+        tasks.handle('/status')
+        self.assertIn('定时任务服务故障', self.bot.telegram.sent[-1][1])
+        for command in (pending, '10分钟后提醒我喝水', '/schedule list'):
+            self.assertIn('定时任务服务故障', self.command(ui, command))
+        self.assertEqual(ui.scheduler.list(), [])
 
     def test_disables_access_and_delivery_if_configured_owner_changes(self):
         ui = self.ui_for()

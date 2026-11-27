@@ -8,7 +8,6 @@ on this module's logger for successful mutations and run outcomes; only IDs,
 operation names and outcomes are logged. Claims are not replayed after a crash.
 """
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -35,6 +34,7 @@ HELP = ('定时任务：/schedule <时间和内容>；例如「10分钟后提醒
         '只读模型任务：/schedule every 2 hours read-only prompt: <问题>。\n'
         '/schedule list [页码]；/schedule pause|resume|remove|run <任务ID>。\n'
         '新建和修改须发送预览中的完整确认命令。')
+WORKER_FAILED = '定时任务服务故障；已暂停受理定时任务，请重启服务。'
 
 
 def _literal(text):
@@ -69,6 +69,7 @@ class JobUI:
         self.scheduler = Scheduler(path)
         self._lock = Lock()
         self._closed = False
+        self._failed = False
         self._pending = None
         self._shutdown = Event()
         self._worker: Thread | None = None
@@ -93,11 +94,15 @@ class JobUI:
             active.stopped = True
             return '已停止本地定时任务，不会发送迟到结果；模型网关可能仍在处理。'
 
+    def failure_notice(self) -> str | None:
+        with self._lock:
+            return WORKER_FAILED if self._failed else None
+
     def start(self, *, interval=1.0, clock=None) -> Thread:
         """Start the daemon worker; return its Thread. The slot factory must not block.
 
         prompt_slot() yields True only if it reserved the shared model slot.
-        It is entered for each tick and exited after any delivery. When it
+        It is entered only before claiming a due prompt. When it
         yields False, reminders still run and prompts are left unclaimed.
         Without a slot factory, the parent asserts no mutual exclusion is needed.
         """
@@ -107,6 +112,8 @@ class JobUI:
         with self._lock:
             if self._closed:
                 raise RuntimeError('job service is closed')
+            if self._failed:
+                raise RuntimeError('job worker failed; reopen the service')
             if self._worker is not None and self._worker.is_alive():
                 return self._worker
             self._worker = Thread(target=self._work, args=(interval, clock), name='minis-jobs', daemon=True)
@@ -118,11 +125,14 @@ class JobUI:
         while not self._shutdown.is_set():
             result = None
             try:
-                slot = self.prompt_slot() if self.prompt_slot is not None else nullcontext(True)
-                with slot as acquired:
-                    result = self.scheduler.tick(deliver=self._deliver, prompt=prompt,
-                                                 allow_prompt=acquired is True, now=clock() if clock else None)
+                result = self.scheduler.tick(deliver=self._deliver, prompt=prompt,
+                                             prompt_slot=self.prompt_slot, now=clock() if clock else None)
             except Exception:
+                with self._lock:
+                    if self._closed:
+                        return
+                    self._failed = True
+                    self._pending = None
                 LOG.error('job worker stopped due to a state or integration error')
                 return
             finally:
@@ -238,6 +248,8 @@ class JobUI:
                 return '定时任务服务已关闭。'
             if self.bot.owner != self.owner:
                 return '定时任务服务不可用；配置的所有者已变更。'
+            if self._failed:
+                return WORKER_FAILED
             expr = text[slash.end():].strip() if slash else text
             try:
                 if slash:

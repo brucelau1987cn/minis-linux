@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
 import sqlite3
 import sys
@@ -853,12 +854,16 @@ class ActiveTask:
 
 class TaskControl:
     """One execution slot; Telegram polling never waits on a model request."""
+    _FINAL_COOLDOWN_BUDGET = 10.0
+    _FINAL_MAX_DEFERRALS = 3
+
     def __init__(self, bot, *, fallback_model=None, vision_enabled=False, voice_model_path=None):
         self.bot = bot
         self.lock = threading.Lock()
         self.active: ActiveTask | None = None
         self.last = None
         self.closed = False
+        self._shutdown = threading.Event()
         self.jobs: JobUI | None = None
         self.scheduled_slot = False
         self.fallback_model = fallback_model
@@ -881,17 +886,20 @@ class TaskControl:
     def close(self):
         with self.lock:
             self.closed = True
+            self._shutdown.set()
             task = self.active
-            if task is None:
-                return
-            if not task.finalizing:
+            if task is not None and not task.finalizing:
                 task.stopped = True
-                if task.stream is not None:
-                    task.stream.cancel()
-                return
-        # The state-directory lock is held by main until serve returns.
-        # Wait for the last possible write, not Telegram delivery.
-        task.history_done.wait()
+            if task is not None and task.stream is not None:
+                task.stream.cancel()
+        try:
+            if self.jobs is not None:
+                self.jobs.close()
+        finally:
+            # main holds the state-directory lease until this returns. Wait
+            # for a committed write, but never wait for model/Telegram I/O.
+            if task is not None and task.finalizing:
+                task.history_done.wait()
 
     def handle(self, text):
         with self.lock:
@@ -919,6 +927,9 @@ class TaskControl:
                 reply = '任务还未结束。请等待；如需停止，先发 /stop 再处理会话。'
             else:
                 reply = None
+        if text == '/status' and self.jobs is not None:
+            if failure := self.jobs.failure_notice():
+                reply = (reply or '') + '\n' + failure
         if text == '/stop' and task is None:
             reply = (self.jobs.stop() if self.jobs is not None else None) or '没有正在运行的任务。'
         if reply is None and self.jobs is not None:
@@ -987,6 +998,37 @@ class TaskControl:
         checkpoint('附件分析完成')
         return response['content']
 
+    def _send_stream_tail(self, stream, reply):
+        telegram = self.bot.telegram
+        deadline = None
+        deferrals = 0
+        for i, part in enumerate(split_reply(stream.finish(reply)), start=int(stream.has_preview)):
+            truncated = i >= MAX_REPLY_CHUNKS
+            if truncated:
+                part = '回复太长，后续内容已省略。'
+            while not self._shutdown.is_set():
+                try:
+                    telegram.send(self.bot.owner, part)
+                except TelegramError as exc:
+                    # Local cooldown or explicit Telegram rejection: only
+                    # this chunk is known unsent. No retry on ambiguous writes.
+                    if exc.code != 429 or deferrals >= self._FINAL_MAX_DEFERRALS:
+                        raise
+                    deferrals += 1
+                    with telegram.send_limit_lock:
+                        now = time.monotonic()
+                        retry_at = max(now, telegram.send_after)
+                    if deadline is None:
+                        deadline = now + self._FINAL_COOLDOWN_BUDGET
+                    if retry_at > deadline or self._shutdown.wait(retry_at - now) or time.monotonic() > deadline:
+                        raise
+                else:
+                    break
+            else:
+                raise TelegramError('sendMessage')
+            if truncated:
+                break
+
     def run(self, task, text, message=None):
         def checkpoint(phase):
             with self.lock:
@@ -1049,17 +1091,17 @@ class TaskControl:
                 if stream is None:
                     self.bot.send_reply(reply)
                 else:
-                    remaining = stream.finish(reply)
-                    for i, part in enumerate(split_reply(remaining), start=int(stream.has_preview)):
-                        if i >= MAX_REPLY_CHUNKS:
-                            self.bot.telegram.send(self.bot.owner, '回复太长，后续内容已省略。')
-                            break
-                        self.bot.telegram.send(self.bot.owner, part)
+                    self._send_stream_tail(stream, reply)
+                    if stream.delivery_uncertain:
+                        outcome = '回复发送状态不明'
+                        LOG.warning('Telegram 预览送达状态不明；未重放预览内容')
                 for preview in previews:
+                    if self._shutdown.is_set():
+                        break
                     self.bot.send_reply(preview)
             except TelegramError:
                 outcome = '回复发送失败'
-                LOG.warning('任务回复未送达或未完整送达；未重试')
+                LOG.warning('任务回复未确认完整送达；不重放已发送或送达不明的内容')
         except TaskStopped:
             outcome = '已停止'
         finally:
@@ -1119,17 +1161,53 @@ def service_options():
     return tz, {'fallback_model': fallback or None, 'vision_enabled': vision == '1', 'voice_model_path': voice or None}
 
 
-def serve(bot, *, tz='UTC', task_options=None, ready=None):
+class _ServiceStopped(Exception):
+    pass
+
+
+class _ServiceStop:
+    """Main-thread SIGTERM state; never unwind a state write asynchronously."""
+    def __init__(self):
+        self.requested = False
+        self.interruptible = False
+
+    def on_signal(self, _sig, _frame):
+        if self.requested:
+            return
+        self.requested = True
+        if self.interruptible:
+            raise _ServiceStopped
+
+    def check(self):
+        if self.requested:
+            raise _ServiceStopped
+
+    def interrupt(self, operation, *args, **kwargs):
+        try:
+            self.interruptible = True
+            self.check()
+            return operation(*args, **kwargs)
+        finally:
+            self.interruptible = False
+
+
+def serve(bot, *, tz='UTC', task_options=None, ready=None, stop=None):
     backoff = 2
     tasks = TaskControl(bot, **(task_options or {}))
     try:
+        if stop is not None:
+            stop.check()
         if bot.features:
             tasks.jobs = JobUI(bot, tz=tz, prompt_slot=tasks.prompt_slot)
             tasks.jobs.start()
         if ready is not None:
+            if stop is not None:
+                stop.check()
             ready()
         LOG.info('Minis Telegram 长轮询已启动（仅白名单私聊）')
         while True:
+            if stop is not None:
+                stop.check()
             try:
                 bot.poll_once(tasks.handle, dispatch_media=tasks.handle_media if bot.features else None)
                 backoff = 2
@@ -1142,12 +1220,13 @@ def serve(bot, *, tz='UTC', task_options=None, ready=None):
                     continue
                 delay = max(backoff, exc.retry_after)
                 LOG.warning('%s；%s 秒后继续轮询', exc, delay)
-                time.sleep(delay)
+                if stop is None:
+                    time.sleep(delay)
+                else:
+                    stop.interrupt(time.sleep, delay)
                 backoff = min(backoff * 2, 60)
     finally:
         tasks.close()
-        if tasks.jobs is not None:
-            tasks.jobs.close()
 
 
 def notify_ready():
@@ -1180,6 +1259,8 @@ def main():
     if os.geteuid() == 0:
         LOG.error('拒绝以 root 运行 Telegram 服务')
         return 78
+    stop = _ServiceStop()
+    previous = signal.signal(signal.SIGTERM, stop.on_signal)
     try:
         home = args.home.expanduser() if args.home else Path.home() / '.local/share/minis-linux-telegram'
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1193,12 +1274,28 @@ def main():
             bot.offset()  # Validate mandatory persisted state before accepting readiness.
             with Workspace(bot.workspace):
                 pass
-            return serve(bot, tz=tz, task_options=task_options, ready=notify_ready)
-    except KeyboardInterrupt:
+            request = telegram.request
+            main_thread = threading.current_thread()
+
+            def service_request(method, body, timeout=15):
+                if threading.current_thread() is main_thread:
+                    return stop.interrupt(request, method, body, timeout=timeout)
+                return request(method, body, timeout=timeout)
+
+            # Only Bot API requests on this thread and backoff are async interruptible.
+            # The cursor, confirmations and shutdown itself must run normally.
+            telegram.request = service_request
+            try:
+                return serve(bot, tz=tz, task_options=task_options, ready=notify_ready, stop=stop)
+            finally:
+                telegram.request = request
+    except (KeyboardInterrupt, _ServiceStopped):
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error):
         LOG.error('Telegram 状态无法读写；请检查状态目录和游标文件')
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == '__main__':

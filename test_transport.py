@@ -123,6 +123,12 @@ class StreamTest(unittest.TestCase):
         self.responses.append(TimeoutError('private request URL'))
         self.assertEqual(self.stream.finish('prefix final'), '')
         self.assertEqual(len(self.calls), 2)
+        self.assertTrue(self.stream.delivery_uncertain)
+
+    def test_acknowledged_final_edit_is_not_uncertain(self):
+        self.stream.delta('prefix')
+        self.assertEqual(self.stream.finish('prefix final'), '')
+        self.assertFalse(self.stream.delivery_uncertain)
 
     def test_http_request_timeout_is_ambiguous(self):
         self.stream.delta('prefix')

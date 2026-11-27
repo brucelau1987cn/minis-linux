@@ -26,6 +26,7 @@ import re
 import sqlite3
 import stat
 import threading
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -458,28 +459,38 @@ class Scheduler:
                 self._db.execute('UPDATE jobs SET manual_at=? WHERE id=?', (at, job_id))
             return _job(self._get(job_id))
 
-    def tick(self, *, deliver, prompt=None, allow_prompt=True, now=None) -> RunResult | None:
+    def tick(self, *, deliver, prompt=None, allow_prompt=True,
+             prompt_slot: Callable[[], ContextManager[bool]] | None = None, now=None) -> RunResult | None:
         """Attempt at most one due run. Call off the polling thread.
 
         deliver(run, text) must raise on failure and not retry uncertain sends.
         Prompt work is deferred unclaimed if no adapter or no model slot is
-        available. None means idle, busy, or closed. A claim commits before I/O:
+        available. A slot factory is entered only for a due prompt, under the
+        state lock before claiming; it must not block or reenter the scheduler.
+        None means idle, busy, or closed. A claim commits before I/O:
         after a crash the run can be lost, but is never replayed automatically.
         """
         _callbacks(deliver, prompt)
-        return self._tick(deliver, prompt if allow_prompt is True else None, now)
+        with ExitStack() as slot:
+            return self._tick(deliver, prompt if allow_prompt is True else None, now, prompt_slot, slot)
 
-    def _tick(self, deliver, prompt, now):
+    def _tick(self, deliver, prompt, now, prompt_slot, slot):
         now = _now(now)
         at = _stamp(now)
         with self._lock:
             if self._closed or self._busy:
                 return None
-            row = self._db.execute('''SELECT *, CASE WHEN manual_at IS NULL THEN next_at
+            def next_due(include_prompts):
+                return self._db.execute('''SELECT *, CASE WHEN manual_at IS NULL THEN next_at
                                           WHEN next_at IS NULL THEN manual_at ELSE min(next_at, manual_at) END AS due_at
                                       FROM jobs WHERE run_id IS NULL AND status != 'paused' AND (kind='reminder' OR ?)
                                       AND (next_at <= ? OR manual_at <= ?)
-                                      ORDER BY due_at, id LIMIT 1''', (prompt is not None, at, at)).fetchone()
+                                      ORDER BY due_at, id LIMIT 1''', (include_prompts, at, at)).fetchone()
+
+            row = next_due(prompt is not None)
+            if row is not None and row['kind'] == 'prompt' and prompt_slot is not None:
+                if slot.enter_context(prompt_slot()) is not True:
+                    row = next_due(False)
             if row is None:
                 return None
             manual = row['due_at'] == row['manual_at'] and row['due_at'] != row['next_at']
@@ -535,9 +546,9 @@ class Scheduler:
         """Start a single daemon worker and return its Thread; close() signals it to stop.
 
         prompt_slot(), if supplied, is a nonblocking context manager yielding
-        True only if it reserved the parent's model slot. Hold it for the tick;
-        a busy slot merely defers prompts, not reminders. When omitted the
-        parent asserts this worker's prompt adapter need not share a slot.
+        True only if it reserved the parent's model slot. Used only before a
+        prompt claim; a busy slot merely defers prompts, not reminders. When
+        omitted, the parent asserts the prompt adapter need not share a slot.
         Slow callbacks occupy the single worker, not the bot's polling thread.
         A state/integration error stops the worker; the parent can monitor the
         returned thread's liveness. Ordinary callback failures are recorded.
@@ -552,11 +563,7 @@ class Scheduler:
             while not self._stop.is_set():
                 try:
                     now = clock() if clock is not None else None
-                    if prompt_slot is not None:
-                        with prompt_slot() as acquired:
-                            self._tick(deliver, prompt if acquired is True else None, now)
-                    else:
-                        self._tick(deliver, prompt, now)
+                    self.tick(deliver=deliver, prompt=prompt, prompt_slot=prompt_slot, now=now)
                 except Exception:
                     # Do not expose callback data or state paths in logs.
                     LOG.error('scheduler worker stopped after a state or integration error')

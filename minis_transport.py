@@ -68,6 +68,11 @@ class TelegramStream:
     def has_preview(self):
         return self._message_id is not None or bool(self._maybe_shown)
 
+    @property
+    def delivery_uncertain(self):
+        """A preview may have been delivered without a usable acknowledgement."""
+        return bool(self._maybe_shown)
+
     def cancel(self):
         """Thread-safe, local only; a reserved/in-flight update may complete.
 
@@ -142,7 +147,10 @@ class TelegramStream:
             head = head.rstrip()
             if head != self._shown:
                 result = self._request(head, final=True)
-                if result is not _SKIPPED and result is not _REJECTED:
+                message_id = result.get('message_id') if isinstance(result, dict) else None
+                if type(message_id) is int and message_id == self._message_id:
+                    self._shown = head
+                elif result is not _SKIPPED and result is not _REJECTED:
                     # This edit could have succeeded even if its response was
                     # lost or malformed. Do not replay the same text as a send.
                     self._maybe_shown = head
