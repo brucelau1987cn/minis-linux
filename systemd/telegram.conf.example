@@ -1,0 +1,4 @@
+# Configuration only; place each credential in its separate protected file.
+MINIS_TELEGRAM_USER_ID=YOUR_NUMERIC_TELEGRAM_USER_ID
+MINIS_BASE_URL=https://api.example.com/v1
+MINIS_MODEL=YOUR_MODEL_ID

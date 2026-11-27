@@ -10,6 +10,7 @@ import re
 import stat
 import sys
 import unicodedata
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -99,7 +100,7 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class Provider:
-    def __init__(self, base, key, model):
+    def __init__(self, base, key, model, *, read_only=False):
         u = urlsplit(base)
         if (not u.hostname or u.username is not None or u.password is not None or u.query or u.fragment
                 or (u.scheme != 'https' and not (u.scheme == 'http' and u.hostname in ('127.0.0.1', '::1')))):
@@ -108,10 +109,11 @@ class Provider:
             raise ValueError('Base URL 端口无效')
         self.endpoint = base.rstrip('/') + '/chat/completions'
         self.key, self.model = key, model
+        self.tools = [t for t in TOOLS if not read_only or t['function']['name'] != 'write_file']
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
     def reply(self, messages):
-        body = {'model': self.model, 'messages': messages, 'tools': TOOLS, 'stream': False}
+        body = {'model': self.model, 'messages': messages, 'tools': self.tools, 'stream': False}
         encoded = json.dumps(body, ensure_ascii=False).encode()
         if len(encoded) > HTTP_LIMIT:
             raise ValueError('请求超过 2 MiB；请用 --session 开新会话')
@@ -173,7 +175,21 @@ def run_tool(workspace, function, allow_noninteractive):
         return '工具未成功：' + safe_display(str(e))
 
 
-def read_history(path):
+def valid_unicode(text: str) -> str:
+    return re.sub(r'[\ud800-\udfff]', '\ufffd', text)
+
+
+def repair_json_text(value: Any) -> Any:
+    if isinstance(value, str):
+        return valid_unicode(value)
+    if isinstance(value, list):
+        return [repair_json_text(item) for item in value]
+    if isinstance(value, dict):
+        return {valid_unicode(key): repair_json_text(item) for key, item in value.items()}
+    return value
+
+
+def read_history(path) -> list[Any]:
     try:
         with path.open('rb') as f:
             raw = f.read(HISTORY_LIMIT + 1)
@@ -184,7 +200,13 @@ def read_history(path):
     data = json.loads(raw)
     if not isinstance(data, list):
         raise ValueError('会话内容无效，请新建会话')
-    return data
+    return repair_json_text(data)
+
+
+def clean_history_temps(path):
+    """Call only when holding the lock for the given state."""
+    for temp in path.parent.glob(f'.{path.name}.*.tmp'):
+        temp.unlink(missing_ok=True)
 
 
 def save_history(path, data):
@@ -192,7 +214,7 @@ def save_history(path, data):
     encoded = json.dumps(data, ensure_ascii=True, indent=2).encode()
     if len(encoded) > HISTORY_LIMIT:
         raise ValueError('会话达到存储上限，请新建会话')
-    with NamedTemporaryFile(dir=path.parent, delete=False) as f:
+    with NamedTemporaryFile(dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp', delete=False) as f:
         temp = Path(f.name)
         try:
             f.write(encoded)
@@ -205,6 +227,7 @@ def save_history(path, data):
 def normalize_reply(raw):
     if not isinstance(raw, dict):
         raise ValueError('模型消息无效')
+    raw = repair_json_text(raw)
     reply = {'role': 'assistant', 'content': raw.get('content')}
     if reply['content'] is not None and not isinstance(reply['content'], str):
         raise ValueError('模型消息内容不是文本')
@@ -230,18 +253,22 @@ def normalize_reply(raw):
     return reply
 
 
-def run_turn(provider, workspace, messages, history_path, demo):
+def complete_turn(provider, workspace, messages, history_path, *, demo=False, read_only=False):
+    system = SYSTEM + (' 此入口的工具只读，不允许创建文件。' if read_only else '')
     for _ in range(MAX_STEPS):
-        reply = normalize_reply(provider.reply([{'role': 'system', 'content': SYSTEM}, *messages]))
+        reply = normalize_reply(provider.reply([{'role': 'system', 'content': system}, *messages]))
         messages.append(reply)
         for call in reply.get('tool_calls', []):
-            result = run_tool(workspace, call['function'], demo)
+            if read_only and call['function']['name'] not in ('read_file', 'list_files'):
+                result = '未授权：Telegram 工作区只读。'
+            else:
+                result = run_tool(workspace, call['function'], demo)
             messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': result})
-        save_history(history_path, messages)
+        if not read_only or not reply.get('tool_calls'):
+            save_history(history_path, messages)
         if not reply.get('tool_calls'):
-            print(safe_display(reply['content']))
-            return 0
-    raise ValueError('达到工具循环上限，已停止，会话已保存')
+            return reply['content']
+    raise ValueError('达到工具循环上限，已停止' + ('' if read_only else '，会话已保存'))
 
 
 def main():
@@ -273,6 +300,7 @@ def main():
         lock = sessions / (args.session + '.lock')
         with lock.open('ab') as guard:
             fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            clean_history_temps(path)
             old = read_history(path)
             if args.history:
                 print(json.dumps(old, ensure_ascii=True, indent=2))
@@ -280,7 +308,9 @@ def main():
             root = home / 'workspace'
             root.mkdir(mode=0o700, exist_ok=True)
             with Workspace(root) as workspace:
-                return run_turn(provider, workspace, [*old, {'role': 'user', 'content': args.prompt}], path, args.demo)
+                reply = complete_turn(provider, workspace, [*old, {'role': 'user', 'content': args.prompt}], path, demo=args.demo)
+                print(safe_display(reply))
+                return 0
     except KeyboardInterrupt:
         print('\n已中断本地任务。已完成的文件操作不会回滚。', file=sys.stderr)
         return 130
