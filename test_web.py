@@ -80,10 +80,17 @@ class WebTest(unittest.TestCase):
     def test_ordinary_prompts_do_not_access_web(self):
         for prompt in ('你好', '解释搜索算法', '搜索引擎是怎么工作的？', '搜索算法是什么？',
                        'I can search for Debian.', 'Search engines explained',
+                       '网页搜索引擎是什么？', '网络搜索算法详解',
                        '“请搜索 Debian”是一条例句', '不要上网搜索 Debian',
                        'translate: please search for Debian', '/search Debian',
                        'ftps://example.org/page', 'Read docs.example.org',
-                       'https://localhost', 'https://example.internal/page'):
+                       'https://localhost', 'https://example.internal/page',
+                       'An example URL is https://example.org/page',
+                       '不要打开 https://example.org/page',
+                       'Please read about HTTP, not https://example.org/page',
+                       'Open https://example.org/one https://example.org/two',
+                       'Read <https://example.org/page>\nNotes about the page',
+                       'Read <https://example.org/page> but do not open it'):
             with self.subTest(prompt=prompt):
                 prepare_web(prompt)
         self.assertEqual(prepare_web('解释搜索算法'), '')
@@ -115,26 +122,47 @@ class WebTest(unittest.TestCase):
         self.assertEqual(len(self.wire.requests), 7)
         self.assertTrue(all(c.args[0] == 'lite.duckduckgo.com.' for c in self.dns.call_args_list))
 
+    def test_search_only_exposes_vetted_source_urls_in_the_footer(self):
+        html = b'''<a class="result-link" href="https://example.org/rejected?sig=fixture-value">Excluded row</a>
+        <a class="result-link" href="https://Example.ORG/report?view=wide#summary">Public report</a>
+        <td class="result-snippet">Summary with https://example.net/path?token=fixture-value</td>'''
+        self.set_wire(reply(html))
+        result = prepare_web('Search for report')
+        self.assertEqual(result.model_data, {
+            'operation': 'search', 'untrusted_web_data': [
+                {'source': 2, 'title': 'Public report', 'snippet': 'Summary with [链接省略]'}],
+        })
+        self.assertEqual(result.source_footer, '来源：\n2. https://Example.ORG/report?view=wide#summary')
+        self.assertEqual(len(self.wire.requests), 1)
+
+    def test_page_visible_urls_are_removed_from_model_data(self):
+        self.set_wire(reply(b'Public text https://example.org/path?token=fixture-value', content_type='text/plain'))
+        result = prepare_web('Please open: <https://example.org/readme>')
+        self.assertEqual(result.model_data['untrusted_web_data'], [{'source': 1, 'text': 'Public text [链接省略]'}])
+        self.assertEqual(result.source_footer, '来源：\n1. https://example.org/readme')
+
     def test_search_no_results_does_not_invent_sources(self):
         self.set_wire(reply(b'<div class="anomaly-modal">challenge</div>'))
         result = prepare_web('Search for Debian')
         self.assertIn('验证页', result)
         self.assertEqual(result.source_footer, '')
 
-    def test_search_does_not_send_multiline_or_oversize_query(self):
+    def test_search_does_not_send_multiline_oversize_or_credential_like_queries(self):
         for prompt in ('搜索：line one\nline two', 'Search for ' + 'a' * 241,
-                       '联网搜索：a\u202eb', '请搜索：\n第二行'):
+                       '联网搜索：a\u202eb', '请搜索：\n第二行',
+                       'Search for api_key=fixture-value', '搜索：password: fixture-value',
+                       'Search for https://intranet.local/report'):
             with self.subTest(prompt=prompt):
                 self.assertTrue(prepare_web(prompt))
         self.dns.assert_not_called()
 
     def test_one_direct_link_pins_ip_but_retains_origin_and_original_link(self):
         url = 'https://News.Example.org/中?q=test#section'
-        result = prepare_web(f'总结<{url}>，也提到 https://example.net/other')
+        result = prepare_web(f'总结<{url}>')
         self.assertIsInstance(result, str)
         self.assertIn('Debian & Linux\n安全 公告。', result)
         self.assertIn('Related article', result)
-        self.assertIn(url, result)
+        self.assertNotIn(url, repr(result.model_data))
         self.assertNotIn('ignore', result)
         self.assertNotIn('Site Menu', result)
         self.assertNotIn('Site Footer', result)
@@ -157,9 +185,9 @@ class WebTest(unittest.TestCase):
     def test_cleartext_read_preserves_balanced_url_punctuation_and_no_tls(self):
         self.dns.return_value = [answer(port=80)]
         self.set_wire(reply('普通文本\n次行'.encode('gb18030'), content_type='text/plain; charset=gb18030'))
-        result = prepare_web('摘要 [链接](http://example.org/wiki/Test_(topic))')
+        result = prepare_web('摘要 [链接](http://example.org/wiki/Test_(topic)?view=full)')
         self.assertIn('普通文本\n次行', result)
-        self.assertIn('1. http://example.org/wiki/Test_(topic)', result.source_footer)
+        self.assertIn('1. http://example.org/wiki/Test_(topic)?view=full', result.source_footer)
         self.assertEqual(self.wire.endpoints, [(PUBLIC_IP, 80)])
         self.tls.assert_not_called()
 
@@ -171,11 +199,37 @@ class WebTest(unittest.TestCase):
                 self.assertEqual(result.source_footer, f'来源：\n1. {url}')
                 self.assertEqual(self.wire.requests[-1].split(' ')[1], urlsplit(url).path)
 
-    def test_direct_link_takes_precedence_over_explicit_search(self):
-        result = prepare_web('Search for https://example.org/article?view=one')
-        self.assertIn('Debian & Linux', result)
-        self.assertEqual(self.dns.call_args.args[0], 'example.org.')
+    def test_explicit_search_with_a_clean_link_does_not_open_it(self):
+        url = 'https://example.org/article?view=one'
+        self.set_wire(reply(SEARCH_HTML))
+        result = prepare_web(f'Search for {url}')
+        self.assertIn('Current security notices', result)
+        self.assertEqual(self.dns.call_args.args[0], 'lite.duckduckgo.com.')
         self.assertEqual(len(self.wire.requests), 1)
+        request_target = self.wire.requests[0].split(' ')[1]
+        self.assertEqual(parse_qs(urlsplit(request_target).query), {'q': [url]})
+
+    def test_potentially_sensitive_links_are_refused_before_network(self):
+        for url in ('https://example.org/article?signature=fixture-value',
+                    'https://example.org/article?unknown=fixture-value',
+                    'https://example.org/article?%73ig=fixture-value',
+                    'https://example.org/report，draft?sig=fixture-value',
+                    'https://example.org/article?view=wide&view=fixture-value',
+                    'https://example.org/article?view=wide%3Bsig%3Dfixture-value',
+                    'https://example.org/article#access_token=fixture-value',
+                    'https://example.org/invite/fixture-value',
+                    'https://example.org/report;signature=fixture-value',
+                    'https://example.org/report;sig=fixture-value',
+                    'https://name:fixture-value@example.org/article'):
+            for prompt in (url, f'Read <{url}>', f'请打开：{url}',
+                           f'Search for {url}', f'A link was mentioned: {url}'):
+                with self.subTest(prompt=prompt):
+                    result = prepare_web(prompt)
+                    self.assertTrue(result)
+                    self.assertFalse(result.source_footer)
+                    self.assertNotIn('fixture-value', result)
+        self.dns.assert_not_called()
+        self.sock.assert_not_called()
 
     def test_rejects_bad_authority_and_nonpublic_literal_before_dns(self):
         for url in ('https://user:secret@example.org/', 'http://localhost./',
