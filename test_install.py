@@ -13,6 +13,173 @@ from unittest.mock import Mock, patch
 
 
 class InstallTest(unittest.TestCase):
+    def test_user_launcher_telegram_setup_hands_off_to_bundled_installer(self):
+        from install import install_user
+        install_user(self.source, self.root)
+        launcher = self.root / '.local/bin/minis'
+        result = subprocess.run([str(launcher), 'telegram', 'setup', '--help'], cwd='/',
+                                env={**os.environ, 'HOME': str(self.root)}, text=True,
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('telegram', result.stdout)
+        bundles = self.root / '.minis/app'
+        bundle, = bundles.iterdir()
+        self.assertTrue((bundle / 'install.py').is_file())
+        self.assertTrue((bundle / 'systemd/minis-linux-telegram.service').is_file())
+        self.assertFalse((self.root / 'etc').exists())
+
+    def test_telegram_setup_cli_dispatches_only_to_bundled_installer_as_root(self):
+        import minis_cli as cli
+        command = [cli.PYTHON, '-EsB', str(self.source / 'install.py'), '--telegram-setup']
+        with patch.object(cli, 'HERE', self.source), patch.object(cli.os, 'geteuid', return_value=0), \
+                patch.object(cli.sys, 'argv', ['minis', 'telegram', 'setup']), \
+                patch.object(cli.os, 'chdir') as chdir, \
+                patch.object(cli.os, 'execv', side_effect=SystemExit(9)) as execv, \
+                patch.object(cli.subprocess, 'run') as run, self.assertRaises(SystemExit) as stopped:
+            cli.main()
+        self.assertEqual(stopped.exception.code, 9)
+        chdir.assert_called_once_with('/')
+        execv.assert_called_once_with(cli.PYTHON, command)
+        run.assert_not_called()
+
+    def test_telegram_setup_only_installs_once_and_does_not_touch_terminal(self):
+        from install import install, UNIT
+        state = self.root / '.minis/terminal'
+        state.mkdir(parents=True)
+        terminal_file = state / 'history'
+        terminal_file.write_bytes(b'private terminal history')
+        ask = Mock(return_value=('123', 'https://example.invalid/v1', 'model',
+                                 '123:' + 'X' * 32, 'fixture-key'))
+        run = Mock()
+        self.assertTrue(install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                                unit_state=lambda: 'not-found'))
+        self.assertIn(['systemctl', 'enable', UNIT], [call.args[0] for call in run.call_args_list])
+        unit = self.root / 'etc/systemd/system' / UNIT
+        before = unit.read_bytes()
+        run.reset_mock()
+        self.assertFalse(install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                                 unit_state=lambda: 'loaded'))
+        ask.assert_called_once()
+        run.assert_not_called()
+        self.assertEqual(unit.read_bytes(), before)
+        self.assertEqual(terminal_file.read_bytes(), b'private terminal history')
+
+    def test_telegram_setup_leaves_vendor_unit_untouched(self):
+        from install import CONFIG_FILES, UNIT, install
+        unit = self.root / 'usr/lib/systemd/system' / UNIT
+        unit.parent.mkdir(parents=True)
+        unit.write_bytes(b'vendor unit')
+        conf = self.root / 'etc/minis-linux'
+        conf.mkdir(parents=True, mode=0o700)
+        for name in CONFIG_FILES:
+            p = conf / name
+            p.write_text('existing configuration')
+            p.chmod(0o600)
+        ask, run = Mock(), Mock()
+        self.assertFalse(install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                                  unit_state=lambda: 'loaded'))
+        self.assertFalse((self.root / 'etc/systemd/system' / UNIT).exists())
+        self.assertEqual(unit.read_bytes(), b'vendor unit')
+        ask.assert_not_called()
+        run.assert_not_called()
+
+    def test_telegram_setup_refuses_orphan_drop_in(self):
+        from install import UNIT, install, telegram_unit_state
+        drop = self.root / 'usr/lib/systemd/system' / (UNIT + '.d') / '99-override.conf'
+        drop.parent.mkdir(parents=True)
+        drop.write_text('[Service]\nExecStart=\nExecStart=/usr/bin/true\n')
+
+        def systemctl(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0,
+                'not-found\n' if 'LoadState' in command else '/etc/systemd/system /usr/lib/systemd/system\n')
+
+        ask, run = Mock(), Mock()
+        with patch('install.subprocess.run', side_effect=systemctl), self.assertRaisesRegex(ValueError, 'drop-in'):
+            install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                    unit_state=lambda: telegram_unit_state(self.root))
+        ask.assert_not_called()
+        run.assert_not_called()
+        self.assertFalse((self.root / 'etc').exists())
+
+    def test_telegram_setup_refuses_dangling_alias_chain(self):
+        from install import UNIT, install, telegram_unit_state
+        etc = self.root / 'etc/systemd/system'
+        vendor = self.root / 'usr/lib/systemd/system'
+        etc.mkdir(parents=True)
+        vendor.mkdir(parents=True)
+        (vendor / 'minis-legacy.service').symlink_to('/etc/systemd/system/' + UNIT)
+        (etc / 'old-bot.service').symlink_to('/usr/lib/systemd/system/minis-legacy.service')
+        drop = etc / 'old-bot.service.d'
+        drop.mkdir()
+        (drop / 'override.conf').write_text('[Service]\nExecStart=\nExecStart=/usr/bin/true\n')
+
+        def systemctl(command, **kwargs):
+            result = 'not-found\n' if 'LoadState' in command else '/etc/systemd/system /usr/lib/systemd/system\n'
+            return subprocess.CompletedProcess(command, 0, result)
+
+        ask, run = Mock(), Mock()
+        with patch('install.subprocess.run', side_effect=systemctl), self.assertRaisesRegex(ValueError, '别名'):
+            install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                    unit_state=lambda: telegram_unit_state(self.root))
+        ask.assert_not_called()
+        run.assert_not_called()
+        self.assertFalse((etc / UNIT).exists())
+        self.assertFalse((self.root / 'etc/minis-linux').exists())
+
+    def test_telegram_setup_fails_closed_when_unit_state_cannot_be_verified(self):
+        from install import install
+        ask, run = Mock(), Mock()
+        with self.assertRaisesRegex(ValueError, '无法确认 Telegram 服务状态'):
+            install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                    unit_state=lambda: '')
+        ask.assert_not_called()
+        run.assert_not_called()
+        self.assertFalse((self.root / 'etc').exists())
+
+    def test_telegram_setup_stops_if_unit_appears_during_wizard(self):
+        from install import UNIT, install
+        ask = Mock(return_value=('123', 'https://example.invalid/v1', 'model',
+                                 '123:' + 'X' * 32, 'fixture-key'))
+        state = Mock(side_effect=['not-found', 'loaded'])
+        run = Mock()
+        with self.assertRaisesRegex(ValueError, '配置期间.*未安装'):
+            install(self.source, self.root, ask=ask, run=run, telegram_setup=True, unit_state=state)
+        self.assertFalse((self.root / 'etc/minis-linux').exists())
+        self.assertFalse((self.root / 'etc/systemd/system' / UNIT).exists())
+        self.assertFalse(any(call.args[0][0] == 'systemctl' for call in run.call_args_list))
+
+    def test_telegram_setup_refuses_unprivileged_without_launching_sudo(self):
+        import minis_cli as cli
+        with patch.object(cli.os, 'geteuid', return_value=1000), \
+                patch.object(cli.sys, 'argv', ['minis', 'telegram', 'setup']), \
+                redirect_stderr(io.StringIO()) as output, patch.object(cli.subprocess, 'run') as run:
+            self.assertEqual(cli.main(), 1)
+        self.assertIn('root', output.getvalue())
+        run.assert_not_called()
+
+    def test_telegram_setup_refuses_linked_system_bundle_before_prompting(self):
+        from install import install
+        app = self.root / 'opt/minis-linux'
+        app.mkdir(parents=True)
+        (app / 'systemd').symlink_to(self.root, target_is_directory=True)
+        ask = Mock()
+        with self.assertRaisesRegex(ValueError, '属主或权限不安全'):
+            install(self.source, self.root, ask=ask, run=Mock(), telegram_setup=True)
+        ask.assert_not_called()
+        self.assertFalse((self.root / 'etc/minis-linux').exists())
+
+    def test_telegram_setup_leaves_pending_install_for_explicit_recovery(self):
+        from install import install, PENDING
+        pending = self.root / PENDING
+        pending.parent.mkdir(parents=True)
+        pending.write_bytes(b'pending installation fixture')
+        ask, run = Mock(), Mock()
+        with self.assertRaisesRegex(ValueError, 'install.py --recover'):
+            install(self.source, self.root, ask=ask, run=run, telegram_setup=True)
+        ask.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(pending.read_bytes(), b'pending installation fixture')
+
     def test_user_only_install_reuses_legacy_config_and_runs_from_other_directory(self):
         from install import install_user
         legacy = self.root / '.local/share/minis-linux-terminal'
@@ -39,6 +206,50 @@ class InstallTest(unittest.TestCase):
         self.assertIn('saved-model', run.stdout)
         self.assertNotIn('fixture-key', run.stdout)
         self.assertFalse((self.root / '.hermes').exists())
+
+    def test_user_update_does_not_overwrite_newer_installed_bundle(self):
+        from install import install_user, APP_FILES, SAMPLE
+        from shutil import copyfile
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory)
+            for rel in (*APP_FILES, SAMPLE):
+                target = candidate / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                copyfile(self.source / rel, target)
+            (candidate / 'VERSION').write_text('10.0.0\n')
+            install_user(candidate, self.root)
+            launcher = self.root / '.local/bin/minis'
+            original = launcher.read_bytes()
+            state = self.root / '.minis/terminal/history'
+            state.write_bytes(b'existing terminal history')
+            self.assertFalse(install_user(self.source, self.root, upgrade_to=(self.source / 'VERSION').read_text().strip()))
+            self.assertEqual(launcher.read_bytes(), original)
+            self.assertEqual(state.read_bytes(), b'existing terminal history')
+            self.assertFalse((self.root / 'etc').exists())
+
+    def test_user_update_accepts_launcher_created_under_home_ancestor_alias(self):
+        from install import install_user, APP_FILES, SAMPLE
+        from shutil import copyfile
+        real = self.root / 'real/alice'
+        real.mkdir(parents=True)
+        alias = self.root / 'alias'
+        alias.symlink_to(real.parent, target_is_directory=True)
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path(directory)
+            for rel in (*APP_FILES, SAMPLE):
+                target = previous / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                copyfile(self.source / rel, target)
+            (previous / 'VERSION').write_text('0.4.0\n')
+            install_user(previous, alias / 'alice')
+        state = real / '.minis/terminal/history'
+        state.write_bytes(b'preserved terminal history')
+        candidate = (self.source / 'VERSION').read_text().strip()
+        self.assertTrue(install_user(self.source, real, upgrade_to=candidate))
+        result = subprocess.run([str(real / '.local/bin/minis'), '--version'], cwd='/',
+                                capture_output=True, check=True, text=True)
+        self.assertEqual(result.stdout.strip(), f'Minis Linux {candidate}')
+        self.assertEqual(state.read_bytes(), b'preserved terminal history')
 
     def test_user_only_install_does_not_overwrite_foreign_launcher(self):
         from install import install_user

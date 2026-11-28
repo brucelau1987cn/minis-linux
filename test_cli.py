@@ -174,6 +174,51 @@ class CliTest(unittest.TestCase):
             git.assert_not_called()
             run.assert_not_called()
 
+    def test_installed_user_update_verifies_tag_then_runs_only_user_installer(self):
+        import minis_cli as cli
+        from unittest.mock import Mock
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            bundle = home / '.minis/app' / ('0.4.1-' + 'a' * 64)
+            bundle.mkdir(parents=True)
+            oid = 'b' * 40
+            verified = []
+
+            def git(args):
+                if args[0] == 'ls-remote':
+                    return f'{oid}\trefs/tags/v0.4.2\n'
+                if args[0] == 'clone':
+                    checkout = Path(args[-1]); checkout.mkdir()
+                    (checkout / 'VERSION').write_text('0.4.2\n')
+                    (checkout / 'install.py').touch()
+                    return ''
+                if 'verify-tag' in args:
+                    if not signed:
+                        raise subprocess.CalledProcessError(1, args)
+                    verified.append(True)
+                    return ''
+                if 'cat-file' in args:
+                    return f'object {oid}\ntype commit\ntag v0.4.2\n\nfixture'
+                return oid + '\n'
+
+            def run(args, **kwargs):
+                self.assertEqual(args[:2], [cli.PYTHON, '-EsB'])
+                self.assertEqual(args[3:], ['--user', '--upgrade-to', '0.4.2'])
+                self.assertEqual(kwargs['env']['HOME'], str(home))
+                self.assertTrue(verified)
+                return subprocess.CompletedProcess(args, 0)
+
+            runner = Mock(side_effect=run)
+            with patch.object(cli, 'HERE', bundle), patch.object(Path, 'home', return_value=home), \
+                    patch.dict('os.environ', HOME=str(home), SUDO_UID=''):
+                signed = False
+                with self.assertRaisesRegex(ValueError, '签名'):
+                    cli.update(check=False, current='0.4.1', git=git, run=runner)
+                runner.assert_not_called()
+                signed = True
+                self.assertEqual(cli.update(check=False, current='0.4.1', git=git, run=runner), 0)
+                runner.assert_called_once()
+
     def test_update_verifies_tag_and_version_before_running_installer(self):
         import minis_cli
         from unittest.mock import Mock
