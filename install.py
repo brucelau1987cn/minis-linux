@@ -327,13 +327,34 @@ def activate(payloads, *, run, root=None):
             raise OSError('未能持久化安装结果；请从可信安装包运行 install.py --recover。') from exc
 
 
-def telegram_unit_state():
+def telegram_unit_state(root=Path('/')):
+    def show(prop, *target):
+        return subprocess.run(['/usr/bin/systemctl', '--system', 'show', '--property', prop, '--value', *target],
+                              cwd='/', capture_output=True, text=True, check=True, timeout=10).stdout.strip()
+
     try:
-        proc = subprocess.run(['/usr/bin/systemctl', 'show', '--property=LoadState', '--value', '--', UNIT],
-                              cwd='/', capture_output=True, text=True, check=True, timeout=10)
+        state = show('LoadState', '--', UNIT)
+        if state != 'not-found':
+            return state
+        paths = show('UnitPath').split()
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError('无法确认 Telegram 服务状态；未安装。') from exc
-    return proc.stdout.strip()
+    if not paths or any(not p.startswith('/') or '..' in Path(p).parts or '\\' in p for p in paths):
+        raise ValueError('无法确认 systemd 单元搜索路径；未安装。')
+    # An unloaded unit does not report orphaned drop-ins. Check every
+    # manager search path before writing a unit that would activate them.
+    stems = UNIT.removesuffix('.service').split('-')
+    drop_ins = [UNIT + '.d', 'service.d', *('-'.join(stems[:i]) + '-.service.d' for i in range(1, len(stems)))]
+    for path in paths:
+        directory = root / path.lstrip('/')
+        candidate = directory / UNIT
+        if candidate.exists() or candidate.is_symlink():
+            return 'loaded'
+        for name in drop_ins:
+            drop = directory / name
+            if drop.is_symlink() or (drop.exists() and (not drop.is_dir() or any(drop.glob('*.conf')))):
+                raise ValueError(f'存在可能影响 Telegram 服务的 systemd drop-in：{drop}；未安装。')
+    return state
 
 
 def install(source, root, *, ask, run, upgrade_to=None, telegram_setup=False, unit_state=telegram_unit_state):
@@ -463,7 +484,8 @@ def install_user(source, home, *, upgrade_to=None):
             if len(words) != 5 or words[:3] != ['exec', '/usr/bin/python3', '-EsB'] or words[4] != '$@':
                 raise ValueError('无法识别现有用户版启动器；未更新。')
             entry = Path(words[3])
-            if entry.name != 'minis_cli.py' or entry.parent.parent != apps:
+            if (not entry.is_absolute() or entry.name != 'minis_cli.py'
+                    or entry.parent.parent.resolve() != apps.resolve()):
                 raise ValueError('现有用户版启动路径无效；未更新。')
             checked_directory(apps, private=True)
             checked_directory(entry.parent, private=True)

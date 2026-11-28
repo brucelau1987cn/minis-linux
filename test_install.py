@@ -83,6 +83,24 @@ class InstallTest(unittest.TestCase):
         ask.assert_not_called()
         run.assert_not_called()
 
+    def test_telegram_setup_refuses_orphan_drop_in(self):
+        from install import UNIT, install, telegram_unit_state
+        drop = self.root / 'usr/lib/systemd/system' / (UNIT + '.d') / '99-override.conf'
+        drop.parent.mkdir(parents=True)
+        drop.write_text('[Service]\nExecStart=\nExecStart=/usr/bin/true\n')
+
+        def systemctl(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0,
+                'not-found\n' if 'LoadState' in command else '/etc/systemd/system /usr/lib/systemd/system\n')
+
+        ask, run = Mock(), Mock()
+        with patch('install.subprocess.run', side_effect=systemctl), self.assertRaisesRegex(ValueError, 'drop-in'):
+            install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                    unit_state=lambda: telegram_unit_state(self.root))
+        ask.assert_not_called()
+        run.assert_not_called()
+        self.assertFalse((self.root / 'etc').exists())
+
     def test_telegram_setup_fails_closed_when_unit_state_cannot_be_verified(self):
         from install import install
         ask, run = Mock(), Mock()
@@ -183,6 +201,30 @@ class InstallTest(unittest.TestCase):
             self.assertEqual(launcher.read_bytes(), original)
             self.assertEqual(state.read_bytes(), b'existing terminal history')
             self.assertFalse((self.root / 'etc').exists())
+
+    def test_user_update_accepts_launcher_created_under_home_ancestor_alias(self):
+        from install import install_user, APP_FILES, SAMPLE
+        from shutil import copyfile
+        real = self.root / 'real/alice'
+        real.mkdir(parents=True)
+        alias = self.root / 'alias'
+        alias.symlink_to(real.parent, target_is_directory=True)
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path(directory)
+            for rel in (*APP_FILES, SAMPLE):
+                target = previous / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                copyfile(self.source / rel, target)
+            (previous / 'VERSION').write_text('0.4.0\n')
+            install_user(previous, alias / 'alice')
+        state = real / '.minis/terminal/history'
+        state.write_bytes(b'preserved terminal history')
+        candidate = (self.source / 'VERSION').read_text().strip()
+        self.assertTrue(install_user(self.source, real, upgrade_to=candidate))
+        result = subprocess.run([str(real / '.local/bin/minis'), '--version'], cwd='/',
+                                capture_output=True, check=True, text=True)
+        self.assertEqual(result.stdout.strip(), f'Minis Linux {candidate}')
+        self.assertEqual(state.read_bytes(), b'preserved terminal history')
 
     def test_user_only_install_does_not_overwrite_foreign_launcher(self):
         from install import install_user
