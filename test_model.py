@@ -1,5 +1,6 @@
 from contextlib import redirect_stdout
 import fcntl
+from http.client import HTTPMessage
 import io
 import json
 import os
@@ -14,6 +15,7 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.error import HTTPError
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +23,80 @@ from minis_cli import main, terminal_provider
 
 
 class ModelCommandTest(unittest.TestCase):
+    def run_secret_prompt(self, keys, expected, success_marker):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        original = termios.tcgetattr(slave)
+        code = ('from minis_cli import ask_secret\n'
+                'try:\n'
+                f'    assert ask_secret("Key: ") == {expected!r}\n'
+                'except KeyboardInterrupt:\n'
+                '    print("cancelled", flush=True)\n'
+                'except ValueError:\n'
+                '    print("rejected", flush=True)\n'
+                'else:\n'
+                '    print("accepted", flush=True)\n')
+        proc = subprocess.Popen([sys.executable, '-EsB', '-c', code], cwd=Path(__file__).resolve().parent,
+                                stdin=slave, stdout=slave, stderr=slave)
+        received = bytearray()
+        deadline = time.monotonic() + 3
+
+        def wait_for(needle):
+            while needle not in received:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, bytes(received))
+                if select.select([master], [], [], remaining)[0]:
+                    received.extend(os.read(master, 4096))
+
+        try:
+            wait_for(b'Key: ')
+            os.write(master, keys)
+            wait_for(success_marker)
+            self.assertEqual(proc.wait(timeout=3), 0)
+            self.assertNotIn(b'fixture-', received)
+            self.assertEqual(termios.tcgetattr(slave), original)
+            return received
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+
+    def test_secret_prompt_masks_typing_and_restores_terminal(self):
+        received = self.run_secret_prompt(b'fixture-xz\x7fy\r', 'fixture-xy', b'accepted')
+        self.assertIn(b'**********\b \b*', received)
+
+    def test_secret_prompt_ctrl_c_masks_input_and_restores_terminal(self):
+        received = self.run_secret_prompt(b'fixture-\x03', None, b'cancelled')
+        self.assertIn(b'********', received)
+
+    def test_secret_prompt_accepts_bracketed_paste(self):
+        received = self.run_secret_prompt(b'\x1b[200~fixture-xy\x1b[201~\r', 'fixture-xy', b'accepted')
+        self.assertIn(b'**********', received)
+
+    def test_secret_prompt_accepts_plain_paste(self):
+        received = self.run_secret_prompt(b'fixture-xy\r', 'fixture-xy', b'accepted')
+        self.assertIn(b'**********', received)
+
+    def test_secret_prompt_rejects_multiline_bracketed_paste(self):
+        self.run_secret_prompt(b'\x1b[200~fixture-xy\rfixture-z\x1b[201~\r', None, b'rejected')
+
+    def test_secret_prompt_escape_still_cancels(self):
+        self.run_secret_prompt(b'fixture-\x1b', None, b'cancelled')
+
+    def test_catalog_auth_error_shows_status_not_response_body(self):
+        self.save()
+        error = HTTPError('https://api.example.com/v1/models', 401, 'private-error-detail',
+                          HTTPMessage(), io.BytesIO(b'private-response-body'))
+        with patch('sys.argv', ['minis', 'model', '--home', str(self.home)]), \
+                patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['1', '']), \
+                patch('minis_cli.model_catalog', side_effect=error), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(), 0)
+        self.assertIn('HTTP 401', output.getvalue())
+        self.assertNotIn('private-', output.getvalue())
+        self.assertEqual(terminal_provider(self.home).model, 'old')
+
     def setUp(self):
         d = TemporaryDirectory()
         self.addCleanup(d.cleanup)
@@ -61,7 +137,7 @@ class ModelCommandTest(unittest.TestCase):
         with patch('sys.argv', ['minis', 'model', '--home', str(self.home)]), \
                 patch('sys.stdin.isatty', return_value=True), \
                 patch('minis_cli.model_catalog', return_value=['vendor/new', 'old']) as catalog, \
-                patch('getpass.getpass', return_value='second-key') as password, \
+                patch('minis_cli.ask_secret', return_value='second-key') as password, \
                 patch('builtins.input', side_effect=['2', 'Backup', 'https://backup.example/v1', '1', 'y', '1', '2', 'y']), \
                 redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main(), 0)
@@ -80,7 +156,7 @@ class ModelCommandTest(unittest.TestCase):
         with patch('sys.argv', ['minis', 'model', '--home', str(self.home)]), \
                 patch('sys.stdin.isatty', return_value=True), \
                 patch('minis_cli.model_catalog', return_value=['new']), \
-                patch('getpass.getpass', return_value='second-key'), \
+                patch('minis_cli.ask_secret', return_value='second-key'), \
                 patch('builtins.input', side_effect=['2', 'Backup', 'https://backup.example/v1', '1', '']), \
                 redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main(), 0)
@@ -207,7 +283,7 @@ class ModelCommandTest(unittest.TestCase):
                     patch('sys.argv', ['minis', 'model', '--home', str(self.home)]), \
                     patch('sys.stdin.isatty', return_value=True), \
                     patch('builtins.input', side_effect=['Test', 'https://example.invalid/v1' + suffix, 'vendor/new']), \
-                    patch('getpass.getpass', return_value='fixture-key'), \
+                    patch('minis_cli.ask_secret', return_value='fixture-key'), \
                     patch('minis_cli.model_catalog', return_value=[]) as catalog, \
                     redirect_stdout(io.StringIO()):
                 self.assertEqual(main(), 1)
@@ -220,7 +296,7 @@ class ModelCommandTest(unittest.TestCase):
 
         class Catalog(BaseHTTPRequestHandler):
             def do_GET(self):
-                seen.append((self.path, self.headers['Authorization']))
+                seen.append((self.path, self.headers['Authorization'], self.headers['User-Agent']))
                 data = json.dumps({'data': [{'id': 'vendor/alpha'}, {'id': 'vendor/beta'}]}).encode()
                 self.send_response(200)
                 self.send_header('Content-Length', str(len(data)))
@@ -232,7 +308,7 @@ class ModelCommandTest(unittest.TestCase):
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                requested_models.append((self.path, body['model']))
+                requested_models.append((self.path, body['model'], self.headers['User-Agent']))
                 data = b'{"choices":[{"message":{"content":"ok"}}]}'
                 self.send_response(200)
                 self.send_header('Content-Length', str(len(data)))
@@ -253,8 +329,9 @@ class ModelCommandTest(unittest.TestCase):
             finally:
                 server.shutdown()
                 thread.join(2)
-        self.assertEqual(seen, [('/v1/models', 'Bearer fixture-key')])
-        self.assertEqual(requested_models, [('/v1/chat/completions', 'vendor/beta')])
+        expected_agent = 'Minis-Linux (+https://github.com/brucelau1987cn/minis-linux)'
+        self.assertEqual(seen, [('/v1/models', 'Bearer fixture-key', expected_agent)])
+        self.assertEqual(requested_models, [('/v1/chat/completions', 'vendor/beta', expected_agent)])
         self.assertIn('vendor/beta', output.getvalue())
         self.assertNotIn('fixture-key', output.getvalue())
         self.assertEqual(terminal_provider(self.home).model, 'vendor/beta')
@@ -274,7 +351,7 @@ class ModelCommandTest(unittest.TestCase):
                 patch('sys.stdin.isatty', return_value=True), \
                 patch.dict(os.environ, {'MINIS_API_KEY': 'not-for-disk'}, clear=True), \
                 patch('builtins.input', side_effect=['Test', 'https://api.example.com/v1', 'vendor/new']), \
-                patch('getpass.getpass', return_value='fixture-new-key'), \
+                patch('minis_cli.ask_secret', return_value='fixture-new-key'), \
                 patch('minis_cli.model_catalog', side_effect=OSError), redirect_stdout(io.StringIO()):
             self.assertEqual(main(), 0)
         self.assertEqual(json.loads(self.config.read_text()),

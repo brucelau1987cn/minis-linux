@@ -2,3 +2,8 @@
 MINIS_TELEGRAM_USER_ID=YOUR_NUMERIC_TELEGRAM_USER_ID
 MINIS_BASE_URL=https://api.example.com/v1
 MINIS_MODEL=YOUR_MODEL_ID
+# Optional; leave unset unless needed.
+# MINIS_SCHEDULE_TZ=Asia/Shanghai
+# MINIS_VISION=1
+# MINIS_VOICE_MODEL=/var/lib/minis-linux-telegram/models/whisper-model.bin
+# MINIS_FALLBACK_MODEL=YOUR_FALLBACK_MODEL_ID

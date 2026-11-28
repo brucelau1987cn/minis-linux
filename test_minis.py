@@ -64,6 +64,31 @@ class MinisTest(unittest.TestCase):
         self.assertEqual(requests[0][:2], ('/v1/chat/completions', 'Bearer fixture-key'))
         self.assertEqual(requests[1][2]['messages'][-1], {'role': 'tool', 'tool_call_id': 'abc', 'content': '[]'})
 
+    def test_read_only_model_gets_clock_and_workspace_disk(self):
+        from datetime import datetime
+        from minis import Provider, Workspace, complete_turn
+        from unittest.mock import patch
+
+        ws = self.base / 'workspace'
+        ws.mkdir()
+        provider = Provider('https://example.invalid/v1', 'fixture-key', 'fixture', read_only=True)
+        names = {tool['function']['name'] for tool in provider.tools}
+        self.assertTrue({'get_current_time', 'get_workspace_disk'} <= names)
+        self.assertNotIn('write_file', names)
+        now = datetime.fromisoformat('2026-11-28T00:30:00+09:00')
+        for name, args, result in (('get_current_time', '{}', '星期六'),
+                                   ('get_workspace_disk', '{}', '可用'),
+                                   ('get_workspace_disk', '{"path":"/etc"}', '工具参数不匹配')):
+            with self.subTest(name=name, args=args), Workspace(ws) as workspace, \
+                    patch('minis.datetime') as clock, patch.object(provider, 'reply', side_effect=[
+                        {'tool_calls': [{'id': 't', 'type': 'function', 'function': {'name': name, 'arguments': args}}]},
+                        {'content': 'ok'},
+                    ]) as reply:
+                clock.now.return_value.astimezone.return_value = now
+                self.assertEqual(complete_turn(provider, workspace, [], None, read_only=True), 'ok')
+                self.assertIn(result, reply.call_args.args[0][-1]['content'])
+                self.assertIn('+09:00', reply.call_args_list[0].args[0][0]['content'])
+
     def test_workspace_blocks_parent_paths_and_symlinks(self):
         from minis import Workspace
         ws = self.base / 'workspace'

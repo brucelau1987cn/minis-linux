@@ -10,6 +10,89 @@ ROOT = Path(__file__).resolve().parent
 
 
 class CliTest(unittest.TestCase):
+    def test_offline_demo_never_searches(self):
+        from contextlib import redirect_stdout
+        import io
+        from minis_cli import terminal_chat
+
+        with TemporaryDirectory() as d, redirect_stdout(io.StringIO()) as output, \
+                patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['/search Debian 安全公告', '/exit']):
+            self.assertEqual(terminal_chat(Path(d), demo=True, plain=True), 0)
+        self.assertIn('离线演示不联网搜索', output.getvalue())
+
+    def test_explicit_search_does_not_call_model_or_write_chat_history(self):
+        from contextlib import redirect_stdout
+        import io
+        from minis_cli import Provider, terminal_chat
+
+        with TemporaryDirectory() as d, redirect_stdout(io.StringIO()) as output, \
+                patch('sys.stdin.isatty', return_value=True), \
+                patch('minis_cli.terminal_provider', return_value=Provider('https://example.invalid/v1', 'test-key', 'test-model')), \
+                patch('minis_cli.search_web', return_value='Debian\nhttps://www.debian.org/') as search, \
+                patch.object(Provider, 'reply', side_effect=AssertionError('called model')), \
+                patch('builtins.input', side_effect=['/search Debian 安全公告', '/exit']):
+            self.assertEqual(terminal_chat(Path(d), plain=True), 0)
+            self.assertFalse((Path(d) / 'telegram/bot-terminal-owner-1.json').exists())
+        search.assert_called_once_with('Debian 安全公告')
+        self.assertIn('https://www.debian.org/', output.getvalue())
+
+    def test_time_and_disk_commands_are_local(self):
+        from contextlib import redirect_stdout
+        import io
+        from minis_cli import terminal_chat
+
+        with TemporaryDirectory() as d, redirect_stdout(io.StringIO()) as output, \
+                patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['/time', '/disk', '/exit']), \
+                patch('minis_cli.EchoDemo.reply', side_effect=AssertionError('called model')):
+            self.assertEqual(terminal_chat(Path(d), demo=True, plain=True), 0)
+        self.assertIn('本机时间：', output.getvalue())
+        self.assertIn('工作区所在文件系统', output.getvalue())
+
+    def test_terminal_window_shows_live_model_and_legacy_plain_mode(self):
+        from contextlib import redirect_stdout
+        import io
+        import json
+        from minis_cli import main, Provider
+
+        with TemporaryDirectory() as d:
+            config = Path(d) / 'terminal-config.json'
+            config.write_text(json.dumps(['https://example.invalid/v1', 'first-model', 'fixture-key']))
+            config.chmod(0o600)
+            for flags in ([], ['--plain']):
+                with patch('sys.argv', ['minis', '--home', d, *flags]), \
+                        patch('sys.stdin.isatty', return_value=True), \
+                        patch.dict(os.environ, {'TERM': 'xterm', 'COLUMNS': '96'}), \
+                        patch('minis_cli.unicode_menu', return_value=True), \
+                        patch('builtins.input', side_effect=['/model next-model', '你好', '/exit']), \
+                        patch.object(Provider, 'reply', return_value={'content': 'mock reply'}), \
+                        redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(), 0)
+                value = output.getvalue()
+                self.assertNotIn('fixture-key', value)
+                self.assertIn('mock reply', value)
+                if flags:
+                    self.assertNotIn('当前模型：', value)
+                else:
+                    self.assertIn('可用工具', value)
+                    self.assertIn('当前模型：first-model', value)
+                    self.assertIn('当前模型：next-model', value)
+                    self.assertIn('上轮耗时：', value)
+
+    def test_terminal_window_falls_back_in_narrow_terminal(self):
+        from contextlib import redirect_stdout
+        import io
+        from minis_cli import terminal_chat
+
+        with TemporaryDirectory() as d, redirect_stdout(io.StringIO()) as output, \
+                patch('sys.stdin.isatty', return_value=True), \
+                patch('minis_cli.TerminalView.width', return_value=32), \
+                patch('builtins.input', side_effect=['你好', '/exit']):
+            self.assertEqual(terminal_chat(Path(d), demo=True), 0)
+        self.assertIn('离线演示：你好', output.getvalue())
+        self.assertNotIn('╭', output.getvalue())
+
     def test_version_reader_rejects_nonregular_and_oversized_files(self):
         from minis_cli import installed_version
         with TemporaryDirectory() as d:
