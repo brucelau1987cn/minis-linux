@@ -350,6 +350,16 @@ def telegram_unit_state(root=Path('/')):
         candidate = directory / UNIT
         if candidate.exists() or candidate.is_symlink():
             return 'loaded'
+        # Refuse aliases even without drop-ins: installing the missing target
+        # can activate the alias and its own overrides. Any alias chain to this
+        # unit has a final hop naming UNIT in one of the manager search paths.
+        try:
+            for alias in directory.iterdir():
+                if alias.suffix == '.service' and alias.is_symlink() and alias.readlink().name == UNIT:
+                    raise ValueError(f'存在指向 Telegram 服务的 systemd 别名：{alias}；未安装。')
+        except FileNotFoundError:
+            if directory.exists():
+                raise ValueError('检查期间 systemd 单元目录发生变化；未安装。') from None
         for name in drop_ins:
             drop = directory / name
             if drop.is_symlink() or (drop.exists() and (not drop.is_dir() or any(drop.glob('*.conf')))):

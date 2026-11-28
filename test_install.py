@@ -101,6 +101,31 @@ class InstallTest(unittest.TestCase):
         run.assert_not_called()
         self.assertFalse((self.root / 'etc').exists())
 
+    def test_telegram_setup_refuses_dangling_alias_chain(self):
+        from install import UNIT, install, telegram_unit_state
+        etc = self.root / 'etc/systemd/system'
+        vendor = self.root / 'usr/lib/systemd/system'
+        etc.mkdir(parents=True)
+        vendor.mkdir(parents=True)
+        (vendor / 'minis-legacy.service').symlink_to('/etc/systemd/system/' + UNIT)
+        (etc / 'old-bot.service').symlink_to('/usr/lib/systemd/system/minis-legacy.service')
+        drop = etc / 'old-bot.service.d'
+        drop.mkdir()
+        (drop / 'override.conf').write_text('[Service]\nExecStart=\nExecStart=/usr/bin/true\n')
+
+        def systemctl(command, **kwargs):
+            result = 'not-found\n' if 'LoadState' in command else '/etc/systemd/system /usr/lib/systemd/system\n'
+            return subprocess.CompletedProcess(command, 0, result)
+
+        ask, run = Mock(), Mock()
+        with patch('install.subprocess.run', side_effect=systemctl), self.assertRaisesRegex(ValueError, '别名'):
+            install(self.source, self.root, ask=ask, run=run, telegram_setup=True,
+                    unit_state=lambda: telegram_unit_state(self.root))
+        ask.assert_not_called()
+        run.assert_not_called()
+        self.assertFalse((etc / UNIT).exists())
+        self.assertFalse((self.root / 'etc/minis-linux').exists())
+
     def test_telegram_setup_fails_closed_when_unit_state_cannot_be_verified(self):
         from install import install
         ask, run = Mock(), Mock()
