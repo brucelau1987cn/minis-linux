@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
-from shlex import quote as shell_quote
+from shlex import quote as shell_quote, split as shell_split
 import stat
 import subprocess
 import sys
@@ -20,10 +20,11 @@ from minis_cli import ask_secret, installed_version, select_model, terminal_conf
 from minis_telegram import Telegram
 
 UNIT = 'minis-linux-telegram.service'
+BUNDLE_UNIT = f'systemd/{UNIT}'
 APP_FILES = (
     'minis.py', 'minis_actions.py', 'minis_cli.py', 'minis_input.py', 'minis_job_ui.py', 'minis_media.py',
     'minis_schedule.py', 'minis_search.py', 'minis_sessions.py', 'minis_skills.py',
-    'minis_telegram.py', 'minis_transport.py', 'minis_web.py', 'VERSION',
+    'minis_telegram.py', 'minis_transport.py', 'minis_web.py', 'VERSION', 'install.py', BUNDLE_UNIT,
 )
 LAUNCHER = b'#!/bin/sh\n# Minis Linux managed launcher\nexec /usr/bin/python3 -EsB /opt/minis-linux/minis_cli.py "$@"\n'
 USER_LAUNCHER = b'#!/bin/sh\n# Minis Linux user launcher\n'
@@ -38,7 +39,7 @@ MANAGED = {*(f'opt/minis-linux/{name}' for name in (*APP_FILES, SAMPLE)),
 
 
 def preflight(source, *, run):
-    for name in (*APP_FILES, SAMPLE, f'systemd/{UNIT}'):
+    for name in (*APP_FILES, SAMPLE):
         path = source / name
         if not path.is_file() or path.is_symlink():
             raise ValueError(f'安装包缺少普通文件：{name}')
@@ -226,6 +227,8 @@ def recover_pending(root, *, run):
             or type(state.get('enabled')) is not bool or not isinstance(state.get('files'), dict)
             or not state['files'] or set(state['files']) - MANAGED):
         raise ValueError('待恢复的安装快照格式无效。')
+    if f'opt/minis-linux/{BUNDLE_UNIT}' in state['files']:
+        checked_directory(root / 'opt/minis-linux/systemd')
     restored = {}
     for name, item in state['files'].items():
         if item is not None:
@@ -324,7 +327,19 @@ def activate(payloads, *, run, root=None):
             raise OSError('未能持久化安装结果；请从可信安装包运行 install.py --recover。') from exc
 
 
-def install(source, root, *, ask, run, upgrade_to=None):
+def telegram_unit_state():
+    try:
+        proc = subprocess.run(['/usr/bin/systemctl', 'show', '--property=LoadState', '--value', '--', UNIT],
+                              cwd='/', capture_output=True, text=True, check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError('无法确认 Telegram 服务状态；未安装。') from exc
+    return proc.stdout.strip()
+
+
+def install(source, root, *, ask, run, upgrade_to=None, telegram_setup=False, unit_state=telegram_unit_state):
+    pending = root / PENDING
+    if telegram_setup and (pending.exists() or pending.is_symlink()):
+        raise ValueError('有未完成的安装；请从启动配置的同一版可信安装包运行 install.py --recover。')
     recovered = recover_pending(root, run=run)
     if recovered == 'rolled-back':
         print('上次中断的安装已回退。')
@@ -335,6 +350,10 @@ def install(source, root, *, ask, run, upgrade_to=None):
         path = root / relative
         if path.exists() or path.is_symlink():
             checked_directory(path)
+    app = root / 'opt/minis-linux'
+    bundle_units = app / 'systemd'
+    if bundle_units.exists() or bundle_units.is_symlink():
+        checked_directory(bundle_units)
     conf = root / 'etc/minis-linux'
     paths = [conf / name for name in CONFIG_FILES]
     if conf.exists() or conf.is_symlink():
@@ -342,11 +361,22 @@ def install(source, root, *, ask, run, upgrade_to=None):
     present = [p.exists() or p.is_symlink() for p in paths]
     if any(present) and not all(present):
         raise ValueError('现有配置不完整；请检查 /etc/minis-linux，未覆盖任何文件。')
+    unit = root / 'etc/systemd/system' / UNIT
+    def has_telegram_unit():
+        state = unit_state()
+        if state not in ('not-found', 'loaded', 'masked'):
+            raise ValueError('无法确认 Telegram 服务状态；未安装。')
+        return state != 'not-found' or unit.exists() or unit.is_symlink()
+
+    if telegram_setup and has_telegram_unit():
+        if not all(present):
+            raise ValueError('已存在 Telegram 服务但缺少配置；未覆盖服务。')
+        print('Telegram 服务已安装；未修改现有配置，也未重启。')
+        return False
     launcher = root / 'usr/local/bin/minis'
     previous_launcher = snapshot_file(launcher)
     if previous_launcher is not None and b'# Minis Linux managed launcher\n' not in previous_launcher[0]:
         raise ValueError('/usr/local/bin/minis 已被其他程序使用；未覆盖。')
-    app = root / 'opt/minis-linux'
     if upgrade_to is not None:
         if not all(present) or installed_version(source) != upgrade_to:
             raise ValueError('未安装完整的 Minis，或更新版本与安装包不匹配。')
@@ -364,6 +394,9 @@ def install(source, root, *, ask, run, upgrade_to=None):
         contents = config_bytes(ask())
     preflight(source, run=run)
 
+    if telegram_setup and has_telegram_unit():
+        raise ValueError('配置期间 Telegram 服务状态已变化；未安装。')
+
     if contents is not None:
         mkdir_checked(conf.parent)
         with tempfile.TemporaryDirectory(prefix='.minis-config-', dir=conf.parent) as scratch:
@@ -376,23 +409,24 @@ def install(source, root, *, ask, run, upgrade_to=None):
             staged.replace(conf)
             sync_directory(conf.parent)
 
-    units = root / 'etc/systemd/system'
     for relative in INSTALL_DIRS:
         mkdir_checked(root / relative)
+    mkdir_checked(bundle_units)
     # File renames sync their immediate parents, not newly created ancestors.
     # Persist the directory tree before any journal can depend on it.
-    for parent in dict.fromkeys((root / relative).parent for relative in reversed(INSTALL_DIRS)):
+    for parent in dict.fromkeys([app, *((root / relative).parent for relative in reversed(INSTALL_DIRS))]):
         sync_directory(parent)
     payloads = {app / name: ((source / name).read_bytes(), 0o644) for name in APP_FILES}
     sample = app / SAMPLE
     if not (sample.exists() or sample.is_symlink()):
         payloads[sample] = ((source / SAMPLE).read_bytes(), 0o644)
-    payloads[units / UNIT] = ((source / 'systemd' / UNIT).read_bytes(), 0o644)
+    payloads[unit] = ((source / BUNDLE_UNIT).read_bytes(), 0o644)
     payloads[launcher] = (LAUNCHER, 0o755)
     activate(payloads, run=run, root=root)
+    return True
 
 
-def install_user(source, home):
+def install_user(source, home, *, upgrade_to=None):
     """Install a per-user terminal app without enabling any system service."""
     names = (*APP_FILES, SAMPLE)
     payloads = {}
@@ -405,6 +439,8 @@ def install_user(source, home):
         payloads[name] = content
         digest.update(name.encode() + b'\0' + sha256(content).digest())
     version = installed_version(source)
+    if upgrade_to is not None and version != upgrade_to:
+        raise ValueError('用户版更新版本与安装包不匹配。')
 
     base, bindir = home / '.minis', home / '.local/bin'
     launcher = bindir / 'minis'
@@ -412,16 +448,32 @@ def install_user(source, home):
     checked_directory(home)
     mkdir_checked(bindir.parent)
     mkdir_checked(bindir)
+    # Reject an unrelated launcher before creating any Minis state. Recheck
+    # under the lock so concurrent user installs cannot bypass the version gate.
     existing = snapshot_file(launcher)
     if existing is not None and not existing[0].startswith(USER_LAUNCHER):
         raise ValueError('~/.local/bin/minis 已被其他程序使用；未覆盖。')
-
     with terminal_lock(base):
         apps, state = base / 'app', base / 'terminal'
+        existing = snapshot_file(launcher)
+        if existing is not None and not existing[0].startswith(USER_LAUNCHER):
+            raise ValueError('~/.local/bin/minis 已被其他程序使用；未覆盖。')
+        if upgrade_to is not None:
+            words = shell_split(existing[0][len(USER_LAUNCHER):].decode()) if existing else []
+            if len(words) != 5 or words[:3] != ['exec', '/usr/bin/python3', '-EsB'] or words[4] != '$@':
+                raise ValueError('无法识别现有用户版启动器；未更新。')
+            entry = Path(words[3])
+            if entry.name != 'minis_cli.py' or entry.parent.parent != apps:
+                raise ValueError('现有用户版启动路径无效；未更新。')
+            checked_directory(apps, private=True)
+            checked_directory(entry.parent, private=True)
+            if version_tuple(version) <= version_tuple(installed_version(entry.parent)):
+                print('用户版已是同版或更新版本，跳过安装。')
+                return False
         mkdir_checked(apps, 0o700)
         bundle = apps / f'{version}-{digest.hexdigest()}'
         if bundle.exists() or bundle.is_symlink():
-            for folder in (bundle, bundle / 'skills', (bundle / SAMPLE).parent):
+            for folder in (bundle, bundle / 'skills', (bundle / SAMPLE).parent, bundle / 'systemd'):
                 checked_directory(folder, private=True)
             for name, content in payloads.items():
                 prior = snapshot_file(bundle / name)
@@ -432,6 +484,7 @@ def install_user(source, home):
                 staged = Path(scratch) / 'bundle'
                 staged.mkdir(mode=0o700)
                 (staged / SAMPLE).parent.mkdir(mode=0o700, parents=True)
+                (staged / 'systemd').mkdir(mode=0o700)
                 for name, content in payloads.items():
                     atomic_write(staged / name, content, 0o600)
                 staged.rename(bundle)
@@ -449,6 +502,7 @@ def install_user(source, home):
             mkdir_checked(state, 0o700)
         entry = shell_quote(str(bundle / 'minis_cli.py'))
         atomic_write(launcher, USER_LAUNCHER + f'exec /usr/bin/python3 -EsB {entry} "$@"\n'.encode(), 0o755)
+        return True
 
 
 def main():
@@ -458,7 +512,10 @@ def main():
     parser.add_argument('--credentials-dir', type=Path, help='read telegram.token and model.key from private files instead of prompting for secrets')
     parser.add_argument('--upgrade-to', help=argparse.SUPPRESS)
     parser.add_argument('--user', action='store_true', help='install only terminal chat into the current user home')
+    parser.add_argument('--telegram-setup', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.telegram_setup and (args.user or args.check or args.recover or args.upgrade_to is not None):
+        parser.error('Telegram 首次配置不能与安装检查、恢复或更新选项合用')
     if sys.platform != 'linux' or sys.version_info < (3, 10):
         parser.error('需要 Linux 和 Python 3.10+。')
     source = Path(__file__).resolve().parent
@@ -468,12 +525,13 @@ def main():
 
     try:
         if args.user:
-            if args.check or args.recover or args.credentials_dir is not None or args.upgrade_to is not None:
+            if args.check or args.recover or args.credentials_dir is not None:
                 parser.error('--user 不能与系统安装选项合用')
             if os.geteuid() == 0 and os.environ.get('SUDO_UID', '') not in ('', '0'):
                 raise ValueError('请直接用目标 Linux 用户运行 --user，不要加 sudo。')
             home = Path.home()
-            install_user(source, home)
+            if not install_user(source, home, upgrade_to=args.upgrade_to):
+                return 0
             print('终端已安装到 ~/.minis；未配置 Telegram。')
             if str(home / '.local/bin') in os.get_exec_path():
                 print('在任意目录输入 minis 开始对话。')
@@ -501,12 +559,16 @@ def main():
                 print({'rolled-back': '已恢复中断前的安装。', 'activated': '已完成已启用的安装。',
                        None: '没有待恢复的安装。'}[recovered])
                 return 0
-            install(source, Path('/'), ask=lambda: ask_config(args.credentials_dir), run=run,
-                    upgrade_to=args.upgrade_to)
+            installed = install(source, Path('/'), ask=lambda: ask_config(args.credentials_dir), run=run,
+                                upgrade_to=args.upgrade_to, telegram_setup=args.telegram_setup)
+        if args.telegram_setup and not installed:
+            return 0
         print('Minis 已安装并设置开机启动。请在专用 Bot 私聊发 /status，再发一句话验证模型。')
         return 0
     except (OSError, ValueError, EOFError, termios.error, subprocess.CalledProcessError) as exc:
         print(f'安装未完成：{exc}', file=sys.stderr)
+        if args.telegram_setup and ((Path('/') / PENDING).exists() or (Path('/') / PENDING).is_symlink()):
+            print('恢复时请使用启动配置的同一版可信安装包。', file=sys.stderr)
         if not args.user:
             print('若服务启动失败，请检查 sudo journalctl -u minis-linux-telegram.service -n 30。', file=sys.stderr)
         return 1

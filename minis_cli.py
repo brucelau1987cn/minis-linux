@@ -107,11 +107,17 @@ def update(*, check, current, git=git_command, run=subprocess.run):
     print(f'发现稳定版本：{current} → {version}', flush=True)
     if check:
         return 0
+    user_home = None
     if HERE != INSTALLED:
-        raise ValueError('此入口不执行系统升级；用户版请从可信新版安装包重新运行 install.py --user。')
-    if os.geteuid() != 0:
+        user_home = Path.home().resolve()
+        if (HERE.parent != user_home / '.minis/app'
+                or not re.fullmatch(re.escape(current) + r'-[a-f0-9]{64}', HERE.name)):
+            raise ValueError('请使用已安装的 minis 启动器更新，或从可信新版安装包重新安装。')
+        if os.geteuid() == 0 and os.environ.get('SUDO_UID', '') not in ('', '0'):
+            raise ValueError('请用原安装用户运行 minis update，不要加 sudo。')
+    elif os.geteuid() != 0:
         return run(['/usr/bin/sudo', '/usr/local/bin/minis', 'update'], check=False).returncode
-    # Explicit root-only staging, independent of user-controlled current directory or TMPDIR.
+    # Explicit private staging, independent of current directory or TMPDIR.
     with tempfile.TemporaryDirectory(prefix='minis-update-', dir='/var/tmp') as tmp:
         checkout = Path(tmp) / 'src'
         tag = f'v{version}'
@@ -138,10 +144,17 @@ def update(*, check, current, git=git_command, run=subprocess.run):
         installer = checkout / 'install.py'
         if not installer.is_file() or installer.is_symlink():
             raise ValueError('稳定版缺少安装器；未安装。')
-        result = run([PYTHON, '-EsB', str(installer), '--upgrade-to', version],
-                     cwd='/', env=clean_environment(), check=False)
+        command = [PYTHON, '-EsB', str(installer)]
+        env = clean_environment()
+        if user_home is not None:
+            command.append('--user')
+            env['HOME'] = str(user_home)
+        result = run([*command, '--upgrade-to', version], cwd='/', env=env, check=False)
         if result.returncode == 0:
-            print(f'Minis Linux 已更新至 {installed_version(INSTALLED)}。')
+            if user_home is None:
+                print(f'Minis Linux 已更新至 {installed_version(INSTALLED)}。')
+            else:
+                print('用户版更新完成；请运行 minis --version 确认当前入口。')
         return result.returncode
 
 
@@ -860,12 +873,41 @@ def terminal_chat(home, *, demo=False, plain=False):
                 view.elapsed = monotonic() - started
 
 
+def telegram_main(argv):
+    parser = argparse.ArgumentParser(prog='minis telegram', description='配置独立的 Telegram 服务，不改终端设置。',
+                                     allow_abbrev=False)
+    subcommands = parser.add_subparsers(dest='action', required=True)
+    setup = subcommands.add_parser('setup', help='首次绑定专用 Bot 并启动服务', allow_abbrev=False)
+    setup.add_argument('--credentials-dir', type=Path, metavar='DIR',
+                       help='从私有目录读取 telegram.token 与 model.key')
+    args = parser.parse_args(argv)
+    if os.geteuid() != 0:
+        raise ValueError('配置 Telegram 系统服务须由 root 执行。请从可信安装包运行 sudo /usr/bin/python3 -EsB install.py，或在 root 终端运行可信的 minis telegram setup。')
+    installer = HERE / 'install.py'
+    if not installer.is_file() or installer.is_symlink():
+        raise ValueError('此安装缺少 Telegram 安装器，请使用可信的新版安装包。')
+    command = [PYTHON, '-EsB', str(installer), '--telegram-setup']
+    if args.credentials_dir is not None:
+        command.extend(['--credentials-dir', str(args.credentials_dir.expanduser().absolute())])
+    # Let the installer own Ctrl-C and its rollback, without a waiting parent.
+    os.chdir('/')
+    os.execv(PYTHON, command)
+
+
 def main():
     if not unicode_menu():
         for stream in (sys.stdout, sys.stderr):
             if isinstance(stream, TextIOWrapper):
                 stream.reconfigure(errors='backslashreplace')
-    parser = argparse.ArgumentParser(description=__doc__)
+    if sys.argv[1:2] == ['telegram']:
+        try:
+            return telegram_main(sys.argv[2:])
+        except KeyboardInterrupt:
+            return 130
+        except (OSError, ValueError) as exc:
+            print('Minis：' + safe_display(str(exc)), file=sys.stderr)
+            return 1
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Telegram 首次配置：minis telegram setup')
     parser.add_argument('command', nargs='?', choices=['update', 'model'])
     parser.add_argument('model_id', nargs='?', metavar='MODEL_ID', help='with model: save a specific ID')
     model_modes = parser.add_mutually_exclusive_group()

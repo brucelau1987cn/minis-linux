@@ -4,6 +4,10 @@
 
 ## 一键部署（推荐）
 
+已经在 root 账号装了 v0.4.1 或更新的终端版时，在可信的 root 终端执行 `minis telegram setup` 即可首次绑定并启动服务，无需再次解压。录制键盘输入时使用 `minis telegram setup --credentials-dir /绝对路径`。终端状态不变；已安装的 Telegram 服务不会被覆盖或重启。此命令不是换绑或修改已有 Bot 的入口。非 root 用户请使用下方可信安装包方式，不要通过 sudo 提权运行用户目录中的启动器。
+
+若向导报告上次安装中断，从**启动配置的同一版可信安装包**执行 `/usr/bin/python3 -EsB install.py --recover`，不要用旧版安装器恢复新版安装记录。
+
 ```bash
 git clone https://github.com/brucelau1987cn/minis-linux.git && cd minis-linux && sudo /usr/bin/python3 -EsB install.py
 ```

@@ -42,7 +42,7 @@ sudo /usr/bin/python3 -EsB install.py
 
 ## 常用命令
 
-只想用终端、不装 Telegram 时，在可信安装包解压目录执行 `/usr/bin/python3 -EsB install.py --user`，不要加 `sudo`。程序和终端状态放在 `~/.minis/`，启动命令放在 `~/.local/bin/minis`；将 `~/.local/bin` 加入 `PATH` 后，可在任意目录运行 `minis`。安装前先退出旧的 Minis 对话；已有终端配置和会话会迁移到 `~/.minis/terminal/`，不会同步给 Telegram。用户版升级时，从可信新版安装包重跑 `install.py --user`；下表中的 `minis update` 安装操作仅适用于系统版。
+只想用终端、不装 Telegram 时，在可信安装包解压目录执行 `/usr/bin/python3 -EsB install.py --user`，不要加 `sudo`。程序和终端状态放在 `~/.minis/`，启动命令放在 `~/.local/bin/minis`；将 `~/.local/bin` 加入 `PATH` 后，可在任意目录运行 `minis`。安装前先退出旧的 Minis 对话；已有终端配置和会话会迁移到 `~/.minis/terminal/`，不会同步给 Telegram。**v0.4.0 及更早的用户版要从可信新版安装包重跑一次 `install.py --user`**。从 v0.4.1 起，用户版可直接以原安装用户运行 `minis update`，不加 `sudo`，不会安装 Telegram 服务。
 
 ```bash
 minis                 # 打开带启动面板和状态行的终端对话
@@ -50,12 +50,15 @@ minis --plain         # 只显示普通命令行提示
 minis model           # 选择或添加网关，再设置终端默认模型（v0.3 起）
 minis model --show    # 查看已保存的终端默认模型
 minis model --fallback MODEL_ID  # 设置当前网关的备用模型（v0.4）
+minis telegram setup  # 在 root 终端首次绑定专用 Bot，启动独立服务
 minis --version       # 查看已安装版本
 minis update --check  # 查找更新，不安装
 minis update          # 验签并安装较新的稳定版
 ```
 
 Telegram 聊天内可用 `/help` 查看命令，`/skills` 列出已装技能。更详细的使用示例与权限说明见[功能说明](docs/features.md)。
+
+从 v0.4.1 起，用户安装包随终端版提供安装器。以后不必再解压安装包：在 root 终端运行可信的 `minis telegram setup`，按向导填写 Telegram 用户 ID、模型网关和专用 Bot Token。该命令仅做首次部署，不改终端配置、历史或工作区，也不覆盖或重启已经安装的 Telegram 服务。非 root 用户请从可信安装包按上面的 `sudo ... install.py` 方式部署，不要用 `sudo` 调用用户目录里的启动器。
 
 `minis model MODEL_ID` 可直接保存当前默认网关上的指定模型。终端对话中的 `/model` 则立即切换当前会话，不改默认设置。两种命令都不改 Telegram 服务的模型配置。
 
